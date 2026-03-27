@@ -1,20 +1,18 @@
 [package]
 name = "claw"
 version = "0.1.0"
-edition = "2024"
+edition = "2021"
 description = "Turn any website into a CLI — with native browser precision"
 license = "MIT"
 repository = "https://github.com/LeonTing1010/claw"
 
 [dependencies]
-tokio = { version = "1", features = ["full"] }
-tokio-tungstenite = "0.24"
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-serde_yaml = "0.9"
-clap = { version = "4", features = ["derive"] }
-mlua = { version = "0.10", features = ["lua54", "async"] }
-tabled = "0.17"
-reqwest = { version = "0.12", features = ["json"] }
-regex = "1"
-futures-util = "0.3"
+tokio = { version = "1.50", features = ["full"] }
+tokio-tungstenite = "0.29"
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.149"
+clap = { version = "4.6", features = ["derive"] }
+serde_yml = "0.0.12"
+regex = "1.12"
+tabled = "0.20"
+futures-util = "0.3.32"

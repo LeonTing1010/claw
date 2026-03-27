@@ -1,0 +1,31 @@
+site: bilibili
+name: hot
+description: B站热门视频
+domain: bilibili.com
+strategy: cookie
+browser: true
+
+args:
+  limit:
+    type: int
+    default: 10
+
+columns: [title, author, views, url]
+
+pipeline:
+  - navigate: https://www.bilibili.com
+  - evaluate: |
+      (async () => {
+        const res = await fetch('https://api.bilibili.com/x/web-interface/ranking/v2', { credentials: 'include' });
+        const data = await res.json();
+        return data.data.list.map(v => ({
+          title: v.title, author: v.owner.name,
+          views: v.stat.view, url: 'https://bilibili.com/video/' + v.bvid
+        }));
+      })()
+  - map:
+      title: ${{ item.title }}
+      author: ${{ item.author }}
+      views: ${{ item.views }}
+      url: ${{ item.url }}
+  - limit: ${{ args.limit }}
