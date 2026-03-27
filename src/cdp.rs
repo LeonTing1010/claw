@@ -63,7 +63,7 @@ fn mouse_event_params(event_type: &str, x: f64, y: f64) -> Value {
 }
 
 /// Escape a string for safe embedding in JavaScript single-quoted strings
-fn escape_js_string(s: &str) -> String {
+pub(crate) fn escape_js_string(s: &str) -> String {
     s.replace('\\', "\\\\")
         .replace('\'', "\\'")
         .replace('"', "\\\"")
@@ -398,6 +398,705 @@ impl CdpClient {
             })),
         )
         .await?;
+        Ok(())
+    }
+
+    /// Wait for a CSS selector to appear in the DOM, polling every 500ms.
+    pub async fn wait_for_selector(
+        &self,
+        selector: &str,
+        timeout_secs: f64,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let js = format!(
+            "document.querySelector('{}') !== null",
+            escape_js_string(selector)
+        );
+        let max_attempts = (timeout_secs * 2.0) as u32; // 500ms per attempt
+        for _ in 0..max_attempts {
+            if let Ok(val) = self.evaluate(&js).await {
+                if val == true {
+                    return Ok(());
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        }
+        Err(format!(
+            "timeout waiting for selector '{}' after {}s",
+            selector, timeout_secs
+        )
+        .into())
+    }
+
+    /// Take a screenshot and save to a file.
+    pub async fn screenshot(&self, path: &str) -> Result<(), Box<dyn std::error::Error>> {
+        let result = self
+            .send(
+                "Page.captureScreenshot",
+                Some(serde_json::json!({"format": "png"})),
+            )
+            .await?;
+        let data = result["data"].as_str().ok_or("missing screenshot data")?;
+        let bytes = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, data)?;
+        std::fs::write(path, bytes)?;
+        Ok(())
+    }
+
+    /// Take a full-page screenshot (captures content beyond viewport).
+    pub async fn screenshot_full(&self, path: &str) -> Result<(), Box<dyn std::error::Error>> {
+        let result = self
+            .send(
+                "Page.captureScreenshot",
+                Some(serde_json::json!({"format": "png", "captureBeyondViewport": true})),
+            )
+            .await?;
+        let data = result["data"].as_str().ok_or("missing screenshot data")?;
+        let bytes = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, data)?;
+        std::fs::write(path, bytes)?;
+        Ok(())
+    }
+
+    // ================================================================
+    // SEE — Agent's Eyes (Perception)
+    // ================================================================
+
+    /// Get the full accessibility tree — the semantic structure of the page.
+    /// This is the primary perception tool: 10k DOM nodes compress to ~500 AX nodes.
+    pub async fn get_ax_tree(
+        &self,
+        depth: Option<i32>,
+    ) -> Result<Value, Box<dyn std::error::Error>> {
+        self.send("Accessibility.enable", None).await?;
+        let mut params = serde_json::json!({});
+        if let Some(d) = depth {
+            params["depth"] = serde_json::json!(d);
+        }
+        let result = self
+            .send("Accessibility.getFullAXTree", Some(params))
+            .await?;
+        Ok(result["nodes"].clone())
+    }
+
+    /// Get a simplified DOM tree — pruned to semantic elements with key attributes.
+    pub async fn get_dom_tree(
+        &self,
+        selector: Option<&str>,
+        depth: i32,
+    ) -> Result<Value, Box<dyn std::error::Error>> {
+        let root = selector.unwrap_or("body");
+        let js = format!(
+            r#"(() => {{
+            function walk(el, d, max) {{
+                if (d > max) return null;
+                const tag = el.tagName?.toLowerCase();
+                if (!tag || ['script','style','noscript','svg','path','link','meta'].includes(tag)) return null;
+                const n = {{ tag }};
+                if (el.id) n.id = el.id;
+                const cls = el.className;
+                if (cls && typeof cls === 'string') {{ const c = cls.trim(); if (c) n.class = c.split(/\s+/).slice(0,3).join(' '); }}
+                const role = el.getAttribute('role'); if (role) n.role = role;
+                const type = el.getAttribute('type'); if (type) n.type = type;
+                const href = el.getAttribute('href'); if (href) n.href = href;
+                const ph = el.getAttribute('placeholder'); if (ph) n.placeholder = ph;
+                const al = el.getAttribute('aria-label'); if (al) n.ariaLabel = al;
+                const nm = el.getAttribute('name'); if (nm) n.name = nm;
+                if (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA' || el.tagName === 'SELECT') n.value = el.value || '';
+                const txt = Array.from(el.childNodes).filter(c => c.nodeType === 3).map(c => c.textContent.trim()).filter(t => t).join(' ');
+                if (txt && txt.length < 200) n.text = txt;
+                const r = el.getBoundingClientRect();
+                if (r.width > 0 && r.height > 0) {{ n.box = [Math.round(r.x), Math.round(r.y), Math.round(r.width), Math.round(r.height)]; }}
+                const ch = Array.from(el.children).map(c => walk(c, d+1, max)).filter(c => c !== null);
+                if (ch.length > 0) n.children = ch;
+                return n;
+            }}
+            const root = document.querySelector('{}');
+            if (!root) throw new Error('selector not found: {}');
+            return walk(root, 0, {});
+        }})()"#,
+            escape_js_string(root),
+            escape_js_string(root),
+            depth
+        );
+        self.evaluate(&js).await
+    }
+
+    /// Get current page info: URL, title, viewport, scroll position, readyState.
+    pub async fn get_page_info(&self) -> Result<Value, Box<dyn std::error::Error>> {
+        let layout = self.send("Page.getLayoutMetrics", None).await?;
+        let info = self
+            .evaluate(
+                r#"({
+            url: location.href,
+            title: document.title,
+            readyState: document.readyState,
+            scrollX: window.scrollX,
+            scrollY: window.scrollY,
+            innerWidth: window.innerWidth,
+            innerHeight: window.innerHeight
+        })"#,
+            )
+            .await?;
+        let mut result = info;
+        if let Some(content) = layout.get("cssContentSize") {
+            result["contentWidth"] = content["width"].clone();
+            result["contentHeight"] = content["height"].clone();
+        }
+        Ok(result)
+    }
+
+    // ================================================================
+    // PROBE — Agent's Instruments (Discovery)
+    // ================================================================
+
+    /// Find elements by visible text and optional role filter.
+    /// Returns list with tag, role, text, selector, coordinates, dimensions.
+    pub async fn find_elements(
+        &self,
+        text: &str,
+        role: Option<&str>,
+    ) -> Result<Value, Box<dyn std::error::Error>> {
+        let role_filter = role.unwrap_or("");
+        let js = format!(
+            r#"(() => {{
+            const query = '{}';
+            const roleFilter = '{}';
+            const results = [];
+            const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_ELEMENT);
+            while (walker.nextNode()) {{
+                const el = walker.currentNode;
+                const rect = el.getBoundingClientRect();
+                if (rect.width === 0 || rect.height === 0) continue;
+                if (el.offsetParent === null && getComputedStyle(el).position !== 'fixed') continue;
+                const directText = Array.from(el.childNodes).filter(n => n.nodeType === 3).map(n => n.textContent.trim()).join(' ');
+                const ariaLabel = el.getAttribute('aria-label') || '';
+                const placeholder = el.getAttribute('placeholder') || '';
+                const matchText = directText || ariaLabel || placeholder;
+                if (!matchText.includes(query)) continue;
+                const tag = el.tagName.toLowerCase();
+                const role = el.getAttribute('role') || tag;
+                if (roleFilter && role !== roleFilter && tag !== roleFilter) continue;
+                let sel = tag;
+                if (el.id) sel = '#' + el.id;
+                else if (el.className && typeof el.className === 'string') {{
+                    const cls = el.className.trim().split(/\s+/)[0];
+                    if (cls) sel = tag + '.' + CSS.escape(cls);
+                }}
+                results.push({{
+                    tag, role, text: matchText.slice(0, 100),
+                    ariaLabel: ariaLabel || undefined,
+                    selector: sel,
+                    x: Math.round(rect.x + rect.width/2),
+                    y: Math.round(rect.y + rect.height/2),
+                    width: Math.round(rect.width),
+                    height: Math.round(rect.height)
+                }});
+            }}
+            return results;
+        }})()"#,
+            escape_js_string(text),
+            escape_js_string(role_filter)
+        );
+        self.evaluate(&js).await
+    }
+
+    /// Deep probe of a single element: tag, attributes, box model, visibility, text.
+    pub async fn get_element_info(
+        &self,
+        selector: &str,
+    ) -> Result<Value, Box<dyn std::error::Error>> {
+        let js = format!(
+            r#"(() => {{
+            const el = document.querySelector('{}');
+            if (!el) throw new Error('element not found: {}');
+            const rect = el.getBoundingClientRect();
+            const cs = getComputedStyle(el);
+            const attrs = {{}};
+            for (const a of el.attributes) attrs[a.name] = a.value;
+            return {{
+                tag: el.tagName.toLowerCase(),
+                attrs,
+                text: (el.textContent || '').trim().slice(0, 500),
+                innerText: (el.innerText || '').trim().slice(0, 500),
+                value: el.value || undefined,
+                box: {{ x: rect.x, y: rect.y, width: rect.width, height: rect.height }},
+                visible: rect.width > 0 && rect.height > 0 && cs.visibility !== 'hidden' && cs.display !== 'none' && cs.opacity !== '0',
+                editable: el.isContentEditable || el.tagName === 'INPUT' || el.tagName === 'TEXTAREA' || el.tagName === 'SELECT',
+                disabled: el.disabled || false,
+                childCount: el.children.length,
+                display: cs.display,
+                position: cs.position,
+                overflow: cs.overflow,
+                zIndex: cs.zIndex
+            }};
+        }})()"#,
+            escape_js_string(selector),
+            escape_js_string(selector)
+        );
+        self.evaluate(&js).await
+    }
+
+    /// Get event listeners attached to an element.
+    pub async fn get_event_listeners(
+        &self,
+        selector: &str,
+    ) -> Result<Value, Box<dyn std::error::Error>> {
+        // First get the RemoteObject for the element
+        let js = format!("document.querySelector('{}')", escape_js_string(selector));
+        let result = self
+            .send(
+                "Runtime.evaluate",
+                Some(serde_json::json!({ "expression": js })),
+            )
+            .await?;
+        let object_id = result["result"]["objectId"]
+            .as_str()
+            .ok_or(format!("element not found: {}", selector))?;
+
+        let listeners = self
+            .send(
+                "DOMDebugger.getEventListeners",
+                Some(serde_json::json!({ "objectId": object_id })),
+            )
+            .await?;
+        Ok(listeners["listeners"].clone())
+    }
+
+    /// Get cookies for the current page.
+    pub async fn get_cookies(&self) -> Result<Value, Box<dyn std::error::Error>> {
+        let result = self.send("Network.getCookies", None).await?;
+        Ok(result["cookies"].clone())
+    }
+
+    /// Hit-test: what element is at pixel (x, y)?
+    pub async fn hit_test(&self, x: f64, y: f64) -> Result<Value, Box<dyn std::error::Error>> {
+        let js = format!(
+            r#"(() => {{
+            const el = document.elementFromPoint({}, {});
+            if (!el) return null;
+            const rect = el.getBoundingClientRect();
+            return {{
+                tag: el.tagName.toLowerCase(),
+                id: el.id || undefined,
+                class: (typeof el.className === 'string' ? el.className : '') || undefined,
+                role: el.getAttribute('role') || undefined,
+                text: (el.textContent || '').trim().slice(0, 100),
+                ariaLabel: el.getAttribute('aria-label') || undefined,
+                box: {{ x: rect.x, y: rect.y, width: rect.width, height: rect.height }}
+            }};
+        }})()"#,
+            x, y
+        );
+        self.evaluate(&js).await
+    }
+
+    /// Get top-layer elements (modals, dialogs, popovers).
+    pub async fn get_top_layer(&self) -> Result<Value, Box<dyn std::error::Error>> {
+        // DOM.getTopLayerElements requires DOM.enable
+        let _ = self.send("DOM.enable", None).await;
+        match self.send("DOM.getTopLayerElements", None).await {
+            Ok(result) => Ok(result["nodeIds"].clone()),
+            Err(_) => {
+                // Fallback: use JS to find dialog/modal elements
+                self.evaluate(
+                    r#"(() => {
+                    const modals = [];
+                    document.querySelectorAll('dialog[open], [role="dialog"], [role="alertdialog"], [aria-modal="true"]').forEach(el => {
+                        const r = el.getBoundingClientRect();
+                        modals.push({
+                            tag: el.tagName.toLowerCase(),
+                            id: el.id || undefined,
+                            role: el.getAttribute('role') || undefined,
+                            text: (el.textContent || '').trim().slice(0, 200),
+                            box: { x: r.x, y: r.y, width: r.width, height: r.height }
+                        });
+                    });
+                    return modals;
+                })()"#,
+                )
+                .await
+            }
+        }
+    }
+
+    /// Force pseudo-state (:hover, :focus, :active) on an element.
+    pub async fn force_pseudo_state(
+        &self,
+        selector: &str,
+        states: &[&str],
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        self.send("CSS.enable", None).await?;
+        self.send("DOM.enable", None).await?;
+
+        // Get the DOM nodeId
+        let doc = self.send("DOM.getDocument", None).await?;
+        let root_id = doc["root"]["nodeId"]
+            .as_i64()
+            .ok_or("missing root nodeId")?;
+        let node = self
+            .send(
+                "DOM.querySelector",
+                Some(serde_json::json!({
+                    "nodeId": root_id,
+                    "selector": selector
+                })),
+            )
+            .await?;
+        let node_id = node["nodeId"]
+            .as_i64()
+            .ok_or(format!("element not found: {}", selector))?;
+
+        self.send(
+            "CSS.forcePseudoState",
+            Some(serde_json::json!({
+                "nodeId": node_id,
+                "forcedPseudoClasses": states
+            })),
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// Start network logging by injecting fetch/XHR monitors.
+    pub async fn start_network_log(&self) -> Result<(), Box<dyn std::error::Error>> {
+        self.evaluate(
+            r#"(() => {
+            if (window.__claw_net) return 'already started';
+            window.__claw_net = [];
+            const origFetch = window.fetch;
+            window.fetch = async function(...args) {
+                const url = typeof args[0] === 'string' ? args[0] : args[0]?.url || '';
+                const method = args[1]?.method || 'GET';
+                const entry = { type: 'fetch', method, url, time: Date.now() };
+                try {
+                    const resp = await origFetch.apply(this, args);
+                    entry.status = resp.status;
+                    window.__claw_net.push(entry);
+                    return resp;
+                } catch(e) {
+                    entry.error = e.message;
+                    window.__claw_net.push(entry);
+                    throw e;
+                }
+            };
+            const origOpen = XMLHttpRequest.prototype.open;
+            const origSend = XMLHttpRequest.prototype.send;
+            XMLHttpRequest.prototype.open = function(method, url) {
+                this.__claw = { type: 'xhr', method, url: String(url), time: Date.now() };
+                return origOpen.apply(this, arguments);
+            };
+            XMLHttpRequest.prototype.send = function() {
+                const entry = this.__claw;
+                this.addEventListener('loadend', function() {
+                    entry.status = this.status;
+                    window.__claw_net.push(entry);
+                });
+                return origSend.apply(this, arguments);
+            };
+            return 'started';
+        })()"#,
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// Get captured network log entries and clear the buffer.
+    pub async fn get_network_log(&self) -> Result<Value, Box<dyn std::error::Error>> {
+        self.evaluate(
+            r#"(() => {
+            const log = window.__claw_net || [];
+            window.__claw_net = [];
+            return log;
+        })()"#,
+        )
+        .await
+    }
+
+    // ================================================================
+    // TRY — Agent's Fingers (Actions)
+    // ================================================================
+
+    /// Hover at exact coordinates (triggers CSS :hover, tooltips, dropdowns).
+    pub async fn hover_at(&self, x: f64, y: f64) -> Result<(), Box<dyn std::error::Error>> {
+        self.send(
+            "Input.dispatchMouseEvent",
+            Some(serde_json::json!({
+                "type": "mouseMoved",
+                "x": x,
+                "y": y
+            })),
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// Hover over element matching CSS selector.
+    pub async fn hover_selector(&self, selector: &str) -> Result<(), Box<dyn std::error::Error>> {
+        let js = format!(
+            r#"(() => {{
+                const el = document.querySelector('{}');
+                if (!el) throw new Error('element not found: {}');
+                const r = el.getBoundingClientRect();
+                if (r.width === 0 && r.height === 0) throw new Error('element not visible: {}');
+                return {{ x: r.x + r.width/2, y: r.y + r.height/2 }};
+            }})()"#,
+            escape_js_string(selector),
+            escape_js_string(selector),
+            escape_js_string(selector)
+        );
+        let result = self.evaluate(&js).await?;
+        let x = result["x"].as_f64().ok_or("missing x coordinate")?;
+        let y = result["y"].as_f64().ok_or("missing y coordinate")?;
+        self.hover_at(x, y).await
+    }
+
+    /// Scroll an element into view.
+    pub async fn scroll_into_view(&self, selector: &str) -> Result<(), Box<dyn std::error::Error>> {
+        let js = format!(
+            r#"(() => {{
+                const el = document.querySelector('{}');
+                if (!el) throw new Error('element not found: {}');
+                el.scrollIntoView({{ behavior: 'instant', block: 'center' }});
+                return true;
+            }})()"#,
+            escape_js_string(selector),
+            escape_js_string(selector)
+        );
+        self.evaluate(&js).await?;
+        Ok(())
+    }
+
+    /// Scroll by a delta amount (pixels).
+    pub async fn scroll_by(
+        &self,
+        delta_x: f64,
+        delta_y: f64,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        self.send(
+            "Input.dispatchMouseEvent",
+            Some(serde_json::json!({
+                "type": "mouseWheel",
+                "x": 400,
+                "y": 300,
+                "deltaX": delta_x,
+                "deltaY": delta_y
+            })),
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// Press a specific key (Enter, Tab, Escape, ArrowDown, etc.) with optional modifiers.
+    /// Modifiers bitmask: Alt=1, Ctrl=2, Meta=4, Shift=8.
+    pub async fn press_key(
+        &self,
+        key: &str,
+        modifiers: u32,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        self.send(
+            "Input.dispatchKeyEvent",
+            Some(key_event_params("keyDown", key, None, modifiers)),
+        )
+        .await?;
+        self.send(
+            "Input.dispatchKeyEvent",
+            Some(key_event_params("keyUp", key, None, 0)),
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// Select an option in a <select> dropdown by value.
+    pub async fn select_option(
+        &self,
+        selector: &str,
+        value: &str,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let js = format!(
+            r#"(() => {{
+                const sel = document.querySelector('{}');
+                if (!sel) throw new Error('select not found: {}');
+                sel.value = '{}';
+                sel.dispatchEvent(new Event('change', {{ bubbles: true }}));
+                sel.dispatchEvent(new Event('input', {{ bubbles: true }}));
+                return sel.value;
+            }})()"#,
+            escape_js_string(selector),
+            escape_js_string(selector),
+            escape_js_string(value)
+        );
+        self.evaluate(&js).await?;
+        Ok(())
+    }
+
+    /// Handle a JavaScript dialog (alert, confirm, prompt, beforeunload).
+    pub async fn dismiss_dialog(
+        &self,
+        accept: bool,
+        prompt_text: Option<&str>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let mut params = serde_json::json!({ "accept": accept });
+        if let Some(text) = prompt_text {
+            params["promptText"] = serde_json::json!(text);
+        }
+        self.send("Page.handleJavaScriptDialog", Some(params))
+            .await?;
+        Ok(())
+    }
+
+    // ================================================================
+    // VERIFY — Agent's Measuring Tape
+    // ================================================================
+
+    /// Wait for visible text to appear on the page.
+    pub async fn wait_for_text(
+        &self,
+        text: &str,
+        timeout_secs: f64,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let js = format!(
+            "document.body.innerText.includes('{}')",
+            escape_js_string(text)
+        );
+        let max_attempts = (timeout_secs * 4.0) as u32; // 250ms per attempt
+        for _ in 0..max_attempts {
+            if let Ok(val) = self.evaluate(&js).await {
+                if val == true {
+                    return Ok(());
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        }
+        Err(format!(
+            "timeout waiting for text '{}' after {}s",
+            text, timeout_secs
+        )
+        .into())
+    }
+
+    /// Wait for URL to match a pattern (substring match).
+    pub async fn wait_for_url(
+        &self,
+        pattern: &str,
+        timeout_secs: f64,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let js = format!("location.href.includes('{}')", escape_js_string(pattern));
+        let max_attempts = (timeout_secs * 4.0) as u32;
+        for _ in 0..max_attempts {
+            if let Ok(val) = self.evaluate(&js).await {
+                if val == true {
+                    return Ok(());
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        }
+        Err(format!(
+            "timeout waiting for URL pattern '{}' after {}s",
+            pattern, timeout_secs
+        )
+        .into())
+    }
+
+    /// Wait for network to become idle (no pending fetch/XHR for duration).
+    pub async fn wait_for_network_idle(
+        &self,
+        timeout_secs: f64,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let js = r#"new Promise(resolve => {
+            let timer = setTimeout(() => resolve(true), 500);
+            const observer = new PerformanceObserver(() => {
+                clearTimeout(timer);
+                timer = setTimeout(() => resolve(true), 500);
+            });
+            observer.observe({ entryTypes: ['resource'] });
+        })"#;
+        let timeout = std::time::Duration::from_secs_f64(timeout_secs);
+        match tokio::time::timeout(timeout, self.evaluate(js)).await {
+            Ok(Ok(_)) => Ok(()),
+            Ok(Err(e)) => Err(e),
+            Err(_) => {
+                Err(format!("timeout waiting for network idle after {}s", timeout_secs).into())
+            }
+        }
+    }
+
+    /// Wait for navigation to complete (URL changes from current).
+    #[allow(dead_code)]
+    pub async fn wait_for_navigation(
+        &self,
+        timeout_secs: f64,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let current_url = self.evaluate("location.href").await?;
+        let current = current_url.as_str().unwrap_or("").to_string();
+        let max_attempts = (timeout_secs * 4.0) as u32;
+        for _ in 0..max_attempts {
+            if let Ok(val) = self.evaluate("location.href").await {
+                if val.as_str().unwrap_or("") != current {
+                    return Ok(());
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        }
+        Err(format!(
+            "timeout waiting for navigation from '{}' after {}s",
+            current, timeout_secs
+        )
+        .into())
+    }
+
+    /// Assert that a CSS selector exists in the DOM.
+    pub async fn assert_selector(&self, selector: &str) -> Result<(), Box<dyn std::error::Error>> {
+        let js = format!(
+            "document.querySelector('{}') !== null",
+            escape_js_string(selector)
+        );
+        let result = self.evaluate(&js).await?;
+        if result != true {
+            return Err(format!("assertion failed: selector '{}' not found", selector).into());
+        }
+        Ok(())
+    }
+
+    /// Assert that visible text exists on the page.
+    pub async fn assert_text(&self, text: &str) -> Result<(), Box<dyn std::error::Error>> {
+        let js = format!(
+            "document.body.innerText.includes('{}')",
+            escape_js_string(text)
+        );
+        let result = self.evaluate(&js).await?;
+        if result != true {
+            return Err(format!("assertion failed: text '{}' not found on page", text).into());
+        }
+        Ok(())
+    }
+
+    /// Assert that the current URL matches a pattern (substring).
+    pub async fn assert_url(&self, pattern: &str) -> Result<(), Box<dyn std::error::Error>> {
+        let url = self.evaluate("location.href").await?;
+        let href = url.as_str().unwrap_or("");
+        if !href.contains(pattern) {
+            return Err(format!(
+                "assertion failed: URL '{}' does not contain '{}'",
+                href, pattern
+            )
+            .into());
+        }
+        Ok(())
+    }
+
+    /// Assert that a CSS selector does NOT exist in the DOM.
+    pub async fn assert_not_selector(
+        &self,
+        selector: &str,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let js = format!(
+            "document.querySelector('{}') === null",
+            escape_js_string(selector)
+        );
+        let result = self.evaluate(&js).await?;
+        if result != true {
+            return Err(
+                format!("assertion failed: selector '{}' should not exist", selector).into(),
+            );
+        }
         Ok(())
     }
 

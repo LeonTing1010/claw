@@ -1,9 +1,23 @@
 use std::path::PathBuf;
 use std::process::Command;
 
+/// Build Chrome launch arguments.
+fn chrome_launch_args(port: u16, headless: bool, profile_dir: &std::path::Path) -> Vec<String> {
+    let mut args = vec![
+        format!("--remote-debugging-port={}", port),
+        format!("--user-data-dir={}", profile_dir.display()),
+        "--no-first-run".to_string(),
+        "--no-default-browser-check".to_string(),
+    ];
+    if headless {
+        args.push("--headless=new".to_string());
+    }
+    args
+}
+
 /// Ensure Chrome is reachable on the given port.
 /// If not, auto-launch a Chrome instance with --remote-debugging-port.
-pub async fn ensure_chrome(port: u16) -> Result<(), Box<dyn std::error::Error>> {
+pub async fn ensure_chrome(port: u16, headless: bool) -> Result<(), Box<dyn std::error::Error>> {
     // Already reachable?
     if is_chrome_reachable(port).await {
         return Ok(());
@@ -18,12 +32,12 @@ pub async fn ensure_chrome(port: u16) -> Result<(), Box<dyn std::error::Error>> 
     std::fs::create_dir_all(&profile_dir).ok();
 
     // Launch Chrome in background
-    Command::new(&chrome_path)
-        .arg(format!("--remote-debugging-port={}", port))
-        .arg(format!("--user-data-dir={}", profile_dir.display()))
-        .arg("--no-first-run")
-        .arg("--no-default-browser-check")
-        .stdout(std::process::Stdio::null())
+    let args = chrome_launch_args(port, headless, &profile_dir);
+    let mut cmd = Command::new(&chrome_path);
+    for arg in &args {
+        cmd.arg(arg);
+    }
+    cmd.stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .spawn()
         .map_err(|e| format!("failed to launch Chrome: {}", e))?;
@@ -122,5 +136,20 @@ mod tests {
     fn chrome_profile_dir_under_home() {
         let dir = chrome_profile_dir();
         assert!(dir.to_string_lossy().contains(".claw/chrome-profile"));
+    }
+
+    #[test]
+    fn chrome_launch_args_headless() {
+        let dir = std::path::Path::new("/tmp/test-profile");
+        let args = chrome_launch_args(9222, true, dir);
+        assert!(args.contains(&"--headless=new".to_string()));
+        assert!(args.contains(&"--remote-debugging-port=9222".to_string()));
+    }
+
+    #[test]
+    fn chrome_launch_args_no_headless() {
+        let dir = std::path::Path::new("/tmp/test-profile");
+        let args = chrome_launch_args(9222, false, dir);
+        assert!(!args.iter().any(|a| a.contains("headless")));
     }
 }

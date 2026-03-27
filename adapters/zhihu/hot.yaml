@@ -1,0 +1,32 @@
+site: zhihu
+name: hot
+description: 知乎热榜
+domain: zhihu.com
+strategy: public
+browser: true
+
+args:
+  limit:
+    type: int
+    default: 20
+
+columns: [rank, title, heat]
+
+pipeline:
+  - navigate: https://www.zhihu.com
+  - wait: 3
+  - evaluate: |
+      (async () => {
+        const res = await fetch('https://www.zhihu.com/api/v3/feed/topstory/hot-lists/total?limit=50');
+        const data = await res.json();
+        return data.data.map((item, i) => ({
+          rank: i + 1,
+          title: item.target.title,
+          heat: item.detail_text || ''
+        }));
+      })()
+  - map:
+      rank: ${{ item.rank }}
+      title: ${{ item.title }}
+      heat: ${{ item.heat }}
+  - limit: ${{ args.limit }}

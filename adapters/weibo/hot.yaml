@@ -1,0 +1,32 @@
+site: weibo
+name: hot
+description: 微博热搜榜
+domain: weibo.com
+strategy: public
+browser: true
+
+args:
+  limit:
+    type: int
+    default: 20
+
+columns: [rank, title, hot]
+
+pipeline:
+  - navigate: https://weibo.com
+  - wait: 3
+  - evaluate: |
+      (async () => {
+        const res = await fetch('https://weibo.com/ajax/side/hotSearch');
+        const data = await res.json();
+        return data.data.realtime.map((item, i) => ({
+          rank: i + 1,
+          title: item.note,
+          hot: item.num || 0
+        }));
+      })()
+  - map:
+      rank: ${{ item.rank }}
+      title: ${{ item.title }}
+      hot: ${{ item.hot }}
+  - limit: ${{ args.limit }}

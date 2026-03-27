@@ -39,6 +39,22 @@ pub enum PipelineStep {
     ClickSelector(String),
     Type { selector: String, text: String },
     Upload { selector: String, files: String },
+    WaitFor { selector: String, timeout: String },
+    WaitForText { text: String, timeout: String },
+    WaitForUrl { pattern: String, timeout: String },
+    WaitForNetworkIdle(String),
+    Screenshot(String),
+    Hover(String),
+    HoverSelector(String),
+    Scroll(String),
+    ScrollBy { x: String, y: String },
+    PressKey { key: String, modifiers: String },
+    Select { selector: String, value: String },
+    DismissDialog(String),
+    AssertSelector(String),
+    AssertText(String),
+    AssertUrl(String),
+    AssertNotSelector(String),
 }
 
 /// Convert a `serde_yml::Value` to a `String`, handling both string values
@@ -161,6 +177,196 @@ where
                         serde::de::Error::custom("upload step requires 'files' field")
                     })?;
                 PipelineStep::Upload { selector, files }
+            }
+            "wait_for" => {
+                let mapping = match &value {
+                    serde_yml::Value::Mapping(m) => m,
+                    _ => {
+                        return Err(serde::de::Error::custom(
+                            "wait_for value must be a mapping with selector and timeout",
+                        ))
+                    }
+                };
+                let selector = mapping
+                    .get(serde_yml::Value::String("selector".into()))
+                    .and_then(yml_value_to_string)
+                    .ok_or_else(|| {
+                        serde::de::Error::custom("wait_for step requires 'selector' field")
+                    })?;
+                let timeout = mapping
+                    .get(serde_yml::Value::String("timeout".into()))
+                    .and_then(yml_value_to_string)
+                    .unwrap_or_else(|| "10".to_string());
+                PipelineStep::WaitFor { selector, timeout }
+            }
+            "screenshot" => {
+                let s = yml_value_to_string(&value)
+                    .ok_or_else(|| serde::de::Error::custom("screenshot value must be a string"))?;
+                PipelineStep::Screenshot(s)
+            }
+            "hover" => {
+                let s = yml_value_to_string(&value)
+                    .ok_or_else(|| serde::de::Error::custom("hover value must be a string"))?;
+                PipelineStep::Hover(s)
+            }
+            "hover_selector" => {
+                let s = yml_value_to_string(&value).ok_or_else(|| {
+                    serde::de::Error::custom("hover_selector value must be a string")
+                })?;
+                PipelineStep::HoverSelector(s)
+            }
+            "scroll" => {
+                let s = yml_value_to_string(&value)
+                    .ok_or_else(|| serde::de::Error::custom("scroll value must be a string"))?;
+                PipelineStep::Scroll(s)
+            }
+            "scroll_by" => {
+                let mapping = match &value {
+                    serde_yml::Value::Mapping(m) => m,
+                    _ => {
+                        return Err(serde::de::Error::custom(
+                            "scroll_by value must be a mapping with x and y",
+                        ))
+                    }
+                };
+                let x = mapping
+                    .get(serde_yml::Value::String("x".into()))
+                    .and_then(yml_value_to_string)
+                    .unwrap_or_else(|| "0".to_string());
+                let y = mapping
+                    .get(serde_yml::Value::String("y".into()))
+                    .and_then(yml_value_to_string)
+                    .unwrap_or_else(|| "0".to_string());
+                PipelineStep::ScrollBy { x, y }
+            }
+            "press_key" => match &value {
+                serde_yml::Value::Mapping(m) => {
+                    let key = m
+                        .get(serde_yml::Value::String("key".into()))
+                        .and_then(yml_value_to_string)
+                        .ok_or_else(|| {
+                            serde::de::Error::custom("press_key step requires 'key' field")
+                        })?;
+                    let modifiers = m
+                        .get(serde_yml::Value::String("modifiers".into()))
+                        .and_then(yml_value_to_string)
+                        .unwrap_or_else(|| "0".to_string());
+                    PipelineStep::PressKey { key, modifiers }
+                }
+                _ => {
+                    let s = yml_value_to_string(&value).ok_or_else(|| {
+                        serde::de::Error::custom("press_key value must be a string or mapping")
+                    })?;
+                    PipelineStep::PressKey {
+                        key: s,
+                        modifiers: "0".to_string(),
+                    }
+                }
+            },
+            "select" => {
+                let mapping = match &value {
+                    serde_yml::Value::Mapping(m) => m,
+                    _ => {
+                        return Err(serde::de::Error::custom(
+                            "select value must be a mapping with selector and value",
+                        ))
+                    }
+                };
+                let selector = mapping
+                    .get(serde_yml::Value::String("selector".into()))
+                    .and_then(yml_value_to_string)
+                    .ok_or_else(|| {
+                        serde::de::Error::custom("select step requires 'selector' field")
+                    })?;
+                let val = mapping
+                    .get(serde_yml::Value::String("value".into()))
+                    .and_then(yml_value_to_string)
+                    .ok_or_else(|| {
+                        serde::de::Error::custom("select step requires 'value' field")
+                    })?;
+                PipelineStep::Select {
+                    selector,
+                    value: val,
+                }
+            }
+            "dismiss_dialog" => {
+                let s = yml_value_to_string(&value).unwrap_or_else(|| "true".to_string());
+                PipelineStep::DismissDialog(s)
+            }
+            "wait_for_text" => match &value {
+                serde_yml::Value::Mapping(m) => {
+                    let text = m
+                        .get(serde_yml::Value::String("text".into()))
+                        .and_then(yml_value_to_string)
+                        .ok_or_else(|| {
+                            serde::de::Error::custom("wait_for_text step requires 'text' field")
+                        })?;
+                    let timeout = m
+                        .get(serde_yml::Value::String("timeout".into()))
+                        .and_then(yml_value_to_string)
+                        .unwrap_or_else(|| "10".to_string());
+                    PipelineStep::WaitForText { text, timeout }
+                }
+                _ => {
+                    let s = yml_value_to_string(&value).ok_or_else(|| {
+                        serde::de::Error::custom("wait_for_text value must be a string or mapping")
+                    })?;
+                    PipelineStep::WaitForText {
+                        text: s,
+                        timeout: "10".to_string(),
+                    }
+                }
+            },
+            "wait_for_url" => match &value {
+                serde_yml::Value::Mapping(m) => {
+                    let pattern = m
+                        .get(serde_yml::Value::String("pattern".into()))
+                        .and_then(yml_value_to_string)
+                        .ok_or_else(|| {
+                            serde::de::Error::custom("wait_for_url step requires 'pattern' field")
+                        })?;
+                    let timeout = m
+                        .get(serde_yml::Value::String("timeout".into()))
+                        .and_then(yml_value_to_string)
+                        .unwrap_or_else(|| "10".to_string());
+                    PipelineStep::WaitForUrl { pattern, timeout }
+                }
+                _ => {
+                    let s = yml_value_to_string(&value).ok_or_else(|| {
+                        serde::de::Error::custom("wait_for_url value must be a string or mapping")
+                    })?;
+                    PipelineStep::WaitForUrl {
+                        pattern: s,
+                        timeout: "10".to_string(),
+                    }
+                }
+            },
+            "wait_for_network_idle" => {
+                let s = yml_value_to_string(&value).unwrap_or_else(|| "10".to_string());
+                PipelineStep::WaitForNetworkIdle(s)
+            }
+            "assert_selector" => {
+                let s = yml_value_to_string(&value).ok_or_else(|| {
+                    serde::de::Error::custom("assert_selector value must be a string")
+                })?;
+                PipelineStep::AssertSelector(s)
+            }
+            "assert_text" => {
+                let s = yml_value_to_string(&value).ok_or_else(|| {
+                    serde::de::Error::custom("assert_text value must be a string")
+                })?;
+                PipelineStep::AssertText(s)
+            }
+            "assert_url" => {
+                let s = yml_value_to_string(&value)
+                    .ok_or_else(|| serde::de::Error::custom("assert_url value must be a string"))?;
+                PipelineStep::AssertUrl(s)
+            }
+            "assert_not_selector" => {
+                let s = yml_value_to_string(&value).ok_or_else(|| {
+                    serde::de::Error::custom("assert_not_selector value must be a string")
+                })?;
+                PipelineStep::AssertNotSelector(s)
             }
             other => {
                 return Err(serde::de::Error::custom(format!(

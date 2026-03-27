@@ -86,6 +86,165 @@ pub async fn execute(
                 let paths: Vec<&str> = file_list.split(',').map(|s| s.trim()).collect();
                 client.upload_files(&sel, &paths).await?;
             }
+            PipelineStep::WaitFor { selector, timeout } => {
+                let ctx = TemplateContext {
+                    args: args.clone(),
+                    item: None,
+                };
+                let sel = template::render(selector, &ctx);
+                let secs: f64 = template::render(timeout, &ctx).parse().unwrap_or(10.0);
+                client.wait_for_selector(&sel, secs).await?;
+            }
+            PipelineStep::WaitForText { text, timeout } => {
+                let ctx = TemplateContext {
+                    args: args.clone(),
+                    item: None,
+                };
+                let txt = template::render(text, &ctx);
+                let secs: f64 = template::render(timeout, &ctx).parse().unwrap_or(10.0);
+                client.wait_for_text(&txt, secs).await?;
+            }
+            PipelineStep::WaitForUrl { pattern, timeout } => {
+                let ctx = TemplateContext {
+                    args: args.clone(),
+                    item: None,
+                };
+                let pat = template::render(pattern, &ctx);
+                let secs: f64 = template::render(timeout, &ctx).parse().unwrap_or(10.0);
+                client.wait_for_url(&pat, secs).await?;
+            }
+            PipelineStep::WaitForNetworkIdle(timeout) => {
+                let ctx = TemplateContext {
+                    args: args.clone(),
+                    item: None,
+                };
+                let secs: f64 = template::render(timeout, &ctx).parse().unwrap_or(10.0);
+                client.wait_for_network_idle(secs).await?;
+            }
+            PipelineStep::Screenshot(path) => {
+                let ctx = TemplateContext {
+                    args: args.clone(),
+                    item: None,
+                };
+                let p = template::render(path, &ctx);
+                client.screenshot(&p).await?;
+            }
+            PipelineStep::Hover(text) => {
+                let ctx = TemplateContext {
+                    args: args.clone(),
+                    item: None,
+                };
+                let t = template::render(text, &ctx);
+                client.click_text(&t).await.ok(); // resolve coords
+                                                  // Actually hover by text - find the element then hover
+                let js = format!(
+                    r#"(() => {{
+                        const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
+                        while (walker.nextNode()) {{
+                            if (walker.currentNode.textContent.trim().includes('{}')) {{
+                                const el = walker.currentNode.parentElement;
+                                if (el && el.offsetParent !== null) {{
+                                    const r = el.getBoundingClientRect();
+                                    if (r.width > 0 && r.height > 0) {{
+                                        return {{ x: r.x + r.width/2, y: r.y + r.height/2 }};
+                                    }}
+                                }}
+                            }}
+                        }}
+                        throw new Error('text not found: {}');
+                    }})()"#,
+                    crate::cdp::escape_js_string(&t),
+                    crate::cdp::escape_js_string(&t)
+                );
+                let result = client.evaluate(&js).await?;
+                let x = result["x"].as_f64().ok_or("missing x")?;
+                let y = result["y"].as_f64().ok_or("missing y")?;
+                client.hover_at(x, y).await?;
+            }
+            PipelineStep::HoverSelector(selector) => {
+                let ctx = TemplateContext {
+                    args: args.clone(),
+                    item: None,
+                };
+                let sel = template::render(selector, &ctx);
+                client.hover_selector(&sel).await?;
+            }
+            PipelineStep::Scroll(selector) => {
+                let ctx = TemplateContext {
+                    args: args.clone(),
+                    item: None,
+                };
+                let sel = template::render(selector, &ctx);
+                client.scroll_into_view(&sel).await?;
+            }
+            PipelineStep::ScrollBy { x, y } => {
+                let ctx = TemplateContext {
+                    args: args.clone(),
+                    item: None,
+                };
+                let dx: f64 = template::render(x, &ctx).parse().unwrap_or(0.0);
+                let dy: f64 = template::render(y, &ctx).parse().unwrap_or(0.0);
+                client.scroll_by(dx, dy).await?;
+            }
+            PipelineStep::PressKey { key, modifiers } => {
+                let ctx = TemplateContext {
+                    args: args.clone(),
+                    item: None,
+                };
+                let k = template::render(key, &ctx);
+                let m: u32 = template::render(modifiers, &ctx).parse().unwrap_or(0);
+                client.press_key(&k, m).await?;
+            }
+            PipelineStep::Select { selector, value } => {
+                let ctx = TemplateContext {
+                    args: args.clone(),
+                    item: None,
+                };
+                let sel = template::render(selector, &ctx);
+                let val = template::render(value, &ctx);
+                client.select_option(&sel, &val).await?;
+            }
+            PipelineStep::DismissDialog(accept) => {
+                let ctx = TemplateContext {
+                    args: args.clone(),
+                    item: None,
+                };
+                let a = template::render(accept, &ctx);
+                let do_accept = a != "false" && a != "0" && a != "dismiss";
+                client.dismiss_dialog(do_accept, None).await?;
+            }
+            PipelineStep::AssertSelector(selector) => {
+                let ctx = TemplateContext {
+                    args: args.clone(),
+                    item: None,
+                };
+                let sel = template::render(selector, &ctx);
+                client.assert_selector(&sel).await?;
+            }
+            PipelineStep::AssertText(text) => {
+                let ctx = TemplateContext {
+                    args: args.clone(),
+                    item: None,
+                };
+                let txt = template::render(text, &ctx);
+                client.assert_text(&txt).await?;
+            }
+            PipelineStep::AssertUrl(pattern) => {
+                let ctx = TemplateContext {
+                    args: args.clone(),
+                    item: None,
+                };
+                let pat = template::render(pattern, &ctx);
+                client.assert_url(&pat).await?;
+            }
+            PipelineStep::AssertNotSelector(selector) => {
+                let ctx = TemplateContext {
+                    args: args.clone(),
+                    item: None,
+                };
+                let sel = template::render(selector, &ctx);
+                client.assert_not_selector(&sel).await?;
+            }
         }
     }
 

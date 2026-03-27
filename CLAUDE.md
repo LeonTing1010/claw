@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-Claw is a Rust CLI tool that turns websites into deterministic command-line interfaces using Chrome DevTools Protocol (CDP) for native browser control. It's compatible with [opencli](https://github.com/jackwener/opencli) YAML adapters but replaces JS event simulation with CDP-level mouse/keyboard/network events, solving SPA framework compatibility issues.
+Claw is a precision browser-automation instrument: **agent-forged, machine-executed**. AI agents explore websites and forge deterministic adapters (YAML/Lua); at execution time, Claw runs those adapters with zero AI involvement — no tokens, no latency, no non-determinism. Built in Rust with Chrome DevTools Protocol (CDP) for native browser control, it delivers CDP-level mouse/keyboard/network precision that works on React/Vue/Angular SPAs where JS `dispatchEvent()` fails.
 
 ## Build & Development Commands
 
@@ -20,14 +20,21 @@ cargo fmt -- --check     # Check formatting without modifying
 
 ## Architecture
 
-Three-layer design:
+Two modes, four layers:
 
-1. **Layer 1 — CDP Client**: WebSocket connection to Chrome DevTools Protocol. All browser interactions (click, type, upload, network intercept) go through CDP native events, not JavaScript injection. This is the core differentiator over opencli.
+- **Forge mode** (development-time): Agent explores sites, tries interactions, observes results, iterates until the adapter is precise. Expensive but one-time.
+- **Execute mode** (runtime): Claw loads the forged adapter and runs it deterministically. Zero AI, sub-second, runs 1000x without drift.
+
+Layers:
+
+0. **Layer 0 — Forge Toolkit** (dev-time only): `screenshot`, `read-dom`, `explore`, `record`, `try` — the Agent's eyes and hands during adapter creation.
+
+1. **Layer 1 — CDP Client**: WebSocket connection to Chrome DevTools Protocol. All browser interactions (click, type, upload, network intercept) go through CDP native events, not JavaScript injection.
 
 2. **Layer 2 — Pipeline Engine**: Executes adapter steps sequentially. Supports opencli-compatible steps (`navigate`, `wait`, `evaluate`, `map`, `limit`, `intercept`) plus claw-native steps (`click`, `click_selector`, `type`, `upload`, `screenshot`). Template variables use `${{ args.name }}` syntax.
 
-3. **Layer 3 — Adapters**: Two types, both hot-loadable from `~/.claw/adapters/` or `./adapters/`:
-   - **YAML adapters** — 100% opencli-compatible format
+3. **Layer 3 — Adapters**: Agent-forged, hot-loadable from `~/.claw/adapters/` or `./adapters/`:
+   - **YAML adapters** — opencli-compatible format (superset)
    - **Lua adapters** — for complex multi-step UI flows, using `mlua` crate with Lua 5.4
 
 ## Key Dependencies
@@ -79,4 +86,4 @@ Business logic tests should be named descriptively: `{module}_{what_it_verifies}
 
 ## Status
 
-Phase 1+2 implemented: CDP client, YAML adapter pipeline, native click/type/upload. Xiaohongshu publish verified end-to-end. See `.claude/DESIGN.md` for the full technical design.
+Phase 1 complete: CDP client, YAML adapter pipeline, native click/type/upload (precision execution layer). Next: Phase 2 — forge toolkit (screenshot, read-dom, explore, record) to enable agent-driven adapter creation. See `.claude/DESIGN.md` for the full technical design and philosophy.

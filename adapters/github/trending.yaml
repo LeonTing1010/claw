@@ -1,0 +1,32 @@
+site: github
+name: trending
+description: GitHub Trending repositories
+domain: github.com
+strategy: public
+browser: true
+
+args:
+  limit:
+    type: int
+    default: 10
+
+columns: [repo, description, stars, language]
+
+pipeline:
+  - navigate: https://github.com/trending
+  - wait: 3
+  - evaluate: |
+      (() => {
+        return Array.from(document.querySelectorAll('article.Box-row')).map(el => ({
+          repo: (el.querySelector('h2 a') || {}).textContent?.trim().replace(/\s+/g, '') || '',
+          description: (el.querySelector('p') || {}).textContent?.trim() || '',
+          stars: (el.querySelector('[href$="/stargazers"]') || {}).textContent?.trim() || '',
+          language: (el.querySelector('[itemprop="programmingLanguage"]') || {}).textContent?.trim() || ''
+        }));
+      })()
+  - map:
+      repo: ${{ item.repo }}
+      description: ${{ item.description }}
+      stars: ${{ item.stars }}
+      language: ${{ item.language }}
+  - limit: ${{ args.limit }}
