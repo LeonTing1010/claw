@@ -45,7 +45,7 @@ claw xiaohongshu publish "content" \
 
 ## Status
 
-Early development. See [DESIGN.md](./DESIGN.md) for the full technical design.
+Early development — CDP client, pipeline engine, and YAML adapters working. Xiaohongshu publish verified end-to-end.
 
 ## License
 

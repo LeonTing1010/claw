@@ -58,8 +58,13 @@ Three-layer design:
 
 ## Project Structure
 
-- `src/main.rs` — CLI entry point (clap), subcommand dispatch
-- `src/cdp.rs` — CDP WebSocket client, browser discovery, high-level operations (navigate, evaluate)
+- `src/main.rs` — CLI entry point (clap), subcommand dispatch, adapter arg parsing
+- `src/cdp.rs` — CDP WebSocket client: connect, navigate, evaluate, click, type, upload
+- `src/adapter.rs` — YAML adapter parser, PipelineStep enum, load_adapter()
+- `src/template.rs` — `${{ }}` template engine (args/item resolution)
+- `src/pipeline.rs` — Pipeline executor: navigate/evaluate/map/limit/click/type/upload/wait
+- `src/output.rs` — Table output formatter (tabled Builder API)
+- `adapters/` — YAML adapter definitions (bilibili, xiaohongshu, demo)
 
 ## Test Conventions
 
@@ -74,4 +79,4 @@ Business logic tests should be named descriptively: `{module}_{what_it_verifies}
 
 ## Status
 
-Phase 1 core implemented: CDP WebSocket client, browser discovery, evaluate/navigate commands. See `DESIGN.md` for the full technical design.
+Phase 1+2 implemented: CDP client, YAML adapter pipeline, native click/type/upload. Xiaohongshu publish verified end-to-end. See `.claude/DESIGN.md` for the full technical design.
