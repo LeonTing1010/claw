@@ -1,4 +1,5 @@
 mod adapter;
+mod browser;
 mod cdp;
 mod output;
 mod pipeline;
@@ -67,10 +68,12 @@ async fn main() {
 async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     match cli.command {
         Command::Version => {
+            browser::ensure_chrome(cli.port).await?;
             let ws_url = cdp::CdpClient::discover_ws_url(cli.port).await?;
             println!("{}", ws_url);
         }
         Command::Evaluate { expression } => {
+            browser::ensure_chrome(cli.port).await?;
             let ws_url = cdp::CdpClient::discover_ws_url(cli.port).await?;
             let client = cdp::CdpClient::connect(&ws_url).await?;
             let result = client.evaluate(&expression).await?;
@@ -82,6 +85,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             println!("{}", out);
         }
         Command::Navigate { url } => {
+            browser::ensure_chrome(cli.port).await?;
             let ws_url = cdp::CdpClient::discover_ws_url(cli.port).await?;
             let client = cdp::CdpClient::connect(&ws_url).await?;
             client.navigate(&url).await?;
@@ -110,7 +114,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             generate(shell, &mut cmd, "claw", &mut std::io::stdout());
         }
         Command::Doctor => {
-            // 1. TCP connectivity
+            // 1. TCP connectivity (don't auto-launch for doctor — diagnostic mode)
             let version_body = match cdp::CdpClient::http_get(cli.port, "/json/version").await {
                 Ok(body) => {
                     let info: serde_json::Value = serde_json::from_str(&body).unwrap_or_default();
@@ -191,6 +195,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 args.insert(k, v);
             }
 
+            browser::ensure_chrome(cli.port).await?;
             let ws_url = cdp::CdpClient::discover_ws_url(cli.port).await?;
             let client = cdp::CdpClient::connect(&ws_url).await?;
 
