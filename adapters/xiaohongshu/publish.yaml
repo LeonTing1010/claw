@@ -4,12 +4,15 @@ description: 小红书发布图文笔记
 domain: creator.xiaohongshu.com
 strategy: cookie
 browser: true
+version: "2"
+last_forged: "2026-03-27"
+forged_by: "claude-opus-4"
 
 args:
-  content:
+  title:
     type: string
     default: ""
-  title:
+  content:
     type: string
     default: ""
   images:
@@ -21,23 +24,19 @@ columns: [status, detail]
 pipeline:
   # 1. 打开发布页
   - navigate: https://creator.xiaohongshu.com/publish/publish
-  - wait: 3
+  - wait_for:
+      selector: ".creator-tab"
+      timeout: 10
 
-  # 2. 切换到"上传图文" tab
-  - evaluate: |
-      (() => {
-        const tabs = document.querySelectorAll('.header-tabs .creator-tab');
-        const t = Array.from(tabs).find(el => el.textContent.includes('上传图文') && el.getBoundingClientRect().x > 0);
-        if (t) t.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
-        return true;
-      })()
+  # 2. 切换到"上传图文" tab（CDP native click）
+  - click: "上传图文"
   - wait: 2
 
   # 3. 上传图片（CDP native DOM.setFileInputFiles）
   - upload:
       selector: "input.upload-input"
       files: "${{ args.images }}"
-  - wait: 15
+  - wait_for_network_idle: 20
 
   # 4. 填写标题（CDP native keyboard）
   - type:
@@ -51,8 +50,8 @@ pipeline:
       text: "${{ args.content }}"
   - wait: 0.5
 
-  # 6. 点击发布按钮（CDP native click on red publish button）
-  - click_selector: ".publish-page-publish-btn button.bg-red"
+  # 6. 点击发布按钮（CDP native click）
+  - click: "发布"
   - wait: 5
 
   # 7. 检查结果

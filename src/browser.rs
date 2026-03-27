@@ -8,9 +8,17 @@ fn chrome_launch_args(port: u16, headless: bool, profile_dir: &std::path::Path) 
         format!("--user-data-dir={}", profile_dir.display()),
         "--no-first-run".to_string(),
         "--no-default-browser-check".to_string(),
+        // Performance: disable features that slow startup without affecting page loading
+        "--disable-sync".to_string(),
+        "--disable-translate".to_string(),
+        "--disable-default-apps".to_string(),
+        "--disable-component-update".to_string(),
     ];
     if headless {
         args.push("--headless=new".to_string());
+        // Headless has no physical display — set a consistent viewport to avoid
+        // tiny default sizes that break coordinate-based interactions.
+        args.push("--window-size=1280,720".to_string());
     }
     args
 }
@@ -111,6 +119,7 @@ fn find_chrome() -> Result<PathBuf, Box<dyn std::error::Error>> {
 }
 
 /// Persistent Chrome profile directory (~/.claw/chrome-profile/).
+/// Uses a dedicated profile so login state persists across runs.
 fn chrome_profile_dir() -> PathBuf {
     let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
     PathBuf::from(home).join(".claw").join("chrome-profile")

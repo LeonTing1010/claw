@@ -1,0 +1,84 @@
+# Template: UI Write Operation (Tier 5)
+#
+# Use when: must interact with the UI directly — publish, submit, upload.
+# Uses CDP native events for framework compatibility (React/Vue/Angular).
+#
+# How to forge:
+#   1. navigate to the target page
+#   2. ax-tree / read-dom to understand page structure
+#   3. find elements by text/selector
+#   4. Build step-by-step with try-step, verify each action
+#   5. Add assert steps to verify success
+#   6. Add if_selector for modal/popup handling
+
+site: SITE_NAME
+name: COMMAND_NAME
+description: DESCRIPTION
+domain: example.com
+strategy: cookie
+browser: true
+version: "1"
+last_forged: "YYYY-MM-DD"
+forged_by: "AGENT_NAME"
+
+args:
+  title:
+    type: string
+    default: ""
+  content:
+    type: string
+    default: ""
+  images:
+    type: string
+    default: ""
+
+columns: [status, detail]
+
+pipeline:
+  # 1. Navigate to the publish page
+  - navigate: https://example.com/publish
+  - wait_for:
+      selector: ".editor"
+      timeout: 10
+
+  # 2. Handle potential modal/popup
+  - if_selector:
+      selector: ".modal-overlay"
+      then:
+        - click_selector: ".modal-close"
+        - wait: 1
+
+  # 3. Upload images (if provided)
+  # - upload:
+  #     selector: "input[type='file']"
+  #     files: "${{ args.images }}"
+  # - wait_for_network_idle: 15
+
+  # 4. Fill form fields
+  - type:
+      selector: ".title-input"
+      text: "${{ args.title }}"
+  - wait: 0.5
+
+  - type:
+      selector: ".content-editor"
+      text: "${{ args.content }}"
+  - wait: 0.5
+
+  # 5. Submit
+  - click: "发布"
+
+  # 6. Verify success
+  - wait_for_url:
+      pattern: "/success"
+      timeout: 10
+  - assert_not_selector: ".error-banner"
+
+  # 7. Return result
+  - evaluate: |
+      (() => {
+        return [{ status: 'published', detail: location.href }];
+      })()
+  - map:
+      status: ${{ item.status }}
+      detail: ${{ item.detail }}

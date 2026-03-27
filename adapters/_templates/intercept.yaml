@@ -1,0 +1,38 @@
+# Template: Network Intercept (Tier 4)
+#
+# Use when: API uses signed requests, CSRF tokens, or other protections
+# that prevent direct replay. Intercept the actual browser request.
+#
+# How to forge:
+#   1. navigate to the site
+#   2. network-log start → trigger the action → network-log dump
+#   3. Identify the API call and its URL pattern
+#   4. Set trigger (what causes the request) and capture (URL pattern)
+
+site: SITE_NAME
+name: COMMAND_NAME
+description: DESCRIPTION
+domain: example.com
+strategy: intercept
+browser: true
+version: "1"
+last_forged: "YYYY-MM-DD"
+forged_by: "AGENT_NAME"
+
+args:
+  limit:
+    type: int
+    default: 10
+
+columns: [title, url]
+
+pipeline:
+  - intercept:
+      trigger: "navigate: https://example.com/feed"
+      capture: "/api/v1/feed"
+      timeout: 10
+      select: data.items
+  - map:
+      title: ${{ item.title }}
+      url: ${{ item.url }}
+  - limit: ${{ args.limit }}

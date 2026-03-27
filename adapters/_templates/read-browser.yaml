@@ -1,0 +1,45 @@
+# Template: Read with Cookie Auth (Tier 2)
+#
+# Use when: API exists but requires login cookies.
+# Navigate to set cookie context, then fetch with credentials.
+#
+# How to forge:
+#   1. navigate to the site (must be logged in via Chrome)
+#   2. network-log start → interact → network-log dump
+#   3. Find the authenticated API endpoint
+#   4. Use evaluate + fetch(url, {credentials:'include'})
+
+site: SITE_NAME
+name: COMMAND_NAME
+description: DESCRIPTION
+domain: example.com
+strategy: cookie
+browser: true
+version: "1"
+last_forged: "YYYY-MM-DD"
+forged_by: "AGENT_NAME"
+
+args:
+  limit:
+    type: int
+    default: 10
+
+columns: [title, author, url]
+
+pipeline:
+  - navigate: https://example.com
+  - evaluate: |
+      (async () => {
+        const res = await fetch('/api/data', { credentials: 'include' });
+        const data = await res.json();
+        return data.items.map(v => ({
+          title: v.title,
+          author: v.author.name,
+          url: v.url
+        }));
+      })()
+  - map:
+      title: ${{ item.title }}
+      author: ${{ item.author }}
+      url: ${{ item.url }}
+  - limit: ${{ args.limit }}

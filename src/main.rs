@@ -1,6 +1,8 @@
 mod adapter;
 mod browser;
 mod cdp;
+mod lua_adapter;
+mod mcp;
 mod output;
 mod pipeline;
 mod template;
@@ -88,6 +90,15 @@ enum Command {
     /// Get current page info (URL, title, viewport, scroll)
     #[command(name = "page-info")]
     PageInfo,
+
+    /// One-shot page exploration — screenshot + interactive elements + forms + auth state
+    Explore {
+        /// URL to explore (navigates first). If omitted, explores the current page.
+        url: Option<String>,
+        /// Screenshot output path
+        #[arg(short, long, default_value = "/tmp/claw-explore.png")]
+        screenshot: String,
+    },
 
     // ---- PROBE (Discovery) ----
     /// Find elements by visible text and optional role
@@ -195,6 +206,62 @@ enum Command {
         prompt_text: Option<String>,
     },
 
+    /// Download a URL to a local file
+    Download {
+        /// URL to download
+        url: String,
+        /// Output file path
+        #[arg(short, long)]
+        output: String,
+    },
+
+    // ---- MCP SERVER ----
+    /// Run as MCP server (stdin/stdout JSON-RPC) for AI agent integration
+    Mcp,
+
+    // ---- FORGE META-TOOLS ----
+    /// Execute a single pipeline step and return structured result
+    #[command(name = "try-step")]
+    TryStep {
+        /// Pipeline step as YAML (e.g. 'navigate: https://example.com')
+        step: String,
+        /// Arguments as key=value pairs
+        #[arg(long, value_delimiter = ',')]
+        args: Vec<String>,
+    },
+    /// Dry-run an adapter and report per-step health
+    #[command(name = "verify-adapter")]
+    VerifyAdapter {
+        /// Site name
+        site: String,
+        /// Adapter name
+        name: String,
+        /// Arguments as --key value pairs (passed through)
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        adapter_args: Vec<String>,
+    },
+
+    /// Save an adapter YAML to ~/.claw/adapters/ (backs up previous version)
+    #[command(name = "save-adapter")]
+    SaveAdapter {
+        /// Path to the adapter YAML file to save
+        file: String,
+    },
+    /// Rollback an adapter to the previous version
+    #[command(name = "rollback-adapter")]
+    RollbackAdapter {
+        /// Site name
+        site: String,
+        /// Adapter name
+        name: String,
+    },
+
+    /// Open a site in the browser for manual login (cookie persists in ~/.claw/chrome-profile/)
+    Login {
+        /// Site domain or adapter site name (e.g. jimeng, xiaohongshu, bilibili)
+        site: String,
+    },
+
     /// Run an adapter (implicit: claw <site> <name> [--args])
     #[command(external_subcommand)]
     Adapter(Vec<String>),
@@ -212,6 +279,16 @@ async fn main() {
 
 async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     match cli.command {
+        Command::Download { url, output } => {
+            let client = reqwest::Client::new();
+            let resp = client.get(&url).send().await?;
+            let bytes = resp.bytes().await?;
+            std::fs::write(&output, &bytes)?;
+            println!("{} ({} bytes)", output, bytes.len());
+        }
+        Command::Mcp => {
+            mcp::serve(cli.port, cli.headless).await?;
+        }
         Command::Version => {
             browser::ensure_chrome(cli.port, cli.headless).await?;
             let ws_url = cdp::CdpClient::discover_ws_url(cli.port).await?;
@@ -351,6 +428,17 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             println!("{}", serde_json::to_string_pretty(&info)?);
         }
 
+        Command::Explore { url, screenshot } => {
+            browser::ensure_chrome(cli.port, cli.headless).await?;
+            let ws_url = cdp::CdpClient::discover_ws_url(cli.port).await?;
+            let client = cdp::CdpClient::connect(&ws_url).await?;
+            if let Some(url) = url {
+                client.navigate(&url).await?;
+            }
+            let result = client.explore(&screenshot).await?;
+            println!("{}", serde_json::to_string_pretty(&result)?);
+        }
+
         // ---- PROBE (Discovery) ----
         Command::Find { query, role } => {
             browser::ensure_chrome(cli.port, cli.headless).await?;
@@ -488,17 +576,58 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             println!("dialog {}", if accept { "accepted" } else { "dismissed" });
         }
 
-        Command::Adapter(raw_args) => {
-            if raw_args.len() < 2 {
-                return Err("usage: claw <site> <name> [--arg value ...]".into());
-            }
-            let site = &raw_args[0];
-            let name = &raw_args[1];
+        // ---- FORGE META-TOOLS ----
+        Command::TryStep { step, args: kv } => {
+            let parsed = adapter::parse_single_step(&step)?;
 
+            // Parse key=value args
+            let mut args = HashMap::new();
+            for pair in &kv {
+                if let Some((k, v)) = pair.split_once('=') {
+                    args.insert(k.to_string(), Value::String(v.to_string()));
+                }
+            }
+
+            browser::ensure_chrome(cli.port, cli.headless).await?;
+            let ws_url = cdp::CdpClient::discover_ws_url(cli.port).await?;
+            let client = cdp::CdpClient::connect(&ws_url).await?;
+
+            let label = pipeline::step_label(&parsed);
+            let start = std::time::Instant::now();
+            let mut data = Vec::new();
+            let mut rows = Vec::new();
+            let result =
+                pipeline::execute_single_step(&parsed, &client, &args, &mut data, &mut rows).await;
+            let duration_ms = start.elapsed().as_millis();
+
+            let (status, error, suggestion) = match result {
+                Ok(()) => ("pass".to_string(), None, None),
+                Err(e) => {
+                    let err_str = e.to_string();
+                    let sug = pipeline::suggest_fix(&err_str);
+                    ("fail".to_string(), Some(err_str), sug)
+                }
+            };
+            let report = pipeline::StepResult {
+                index: 0,
+                step: label,
+                status,
+                duration_ms,
+                error,
+                suggestion,
+                page_url: None,
+                screenshot_path: None,
+            };
+            println!("{}", serde_json::to_string_pretty(&report)?);
+        }
+        Command::VerifyAdapter {
+            site,
+            name,
+            adapter_args,
+        } => {
             let dirs = adapter_base_dirs();
             let refs: Vec<&str> = dirs.iter().map(|s| s.as_str()).collect();
-
-            let ada = adapter::load_adapter(&refs, site, name)?;
+            let ada = adapter::load_adapter(&refs, &site, &name)?;
 
             // Merge defaults + CLI args
             let mut args = HashMap::new();
@@ -509,7 +638,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                     }
                 }
             }
-            let cli_args = parse_adapter_args(&raw_args[2..]);
+            let cli_args = parse_adapter_args(&adapter_args);
             for (k, v) in cli_args {
                 args.insert(k, v);
             }
@@ -518,8 +647,128 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             let ws_url = cdp::CdpClient::discover_ws_url(cli.port).await?;
             let client = cdp::CdpClient::connect(&ws_url).await?;
 
-            let rows = pipeline::execute(&ada.pipeline, &client, args).await?;
-            output::print_output(&ada.columns, &rows, &cli.format)?;
+            let results = pipeline::execute_with_report(&ada.pipeline, &client, args).await;
+
+            let pass_count = results.iter().filter(|r| r.status == "pass").count();
+            let total = results.len();
+
+            println!("{}", serde_json::to_string_pretty(&results)?);
+            eprintln!(
+                "\n{}/{} steps passed ({})",
+                pass_count,
+                total,
+                if pass_count == total {
+                    "healthy"
+                } else {
+                    "BROKEN"
+                }
+            );
+
+            if pass_count != total {
+                std::process::exit(1);
+            }
+        }
+
+        Command::SaveAdapter { file } => {
+            // Parse the adapter to validate and extract site/name
+            let content = std::fs::read_to_string(&file)?;
+            let ada: adapter::Adapter = serde_yml::from_str(&content)?;
+
+            let home = std::env::var("HOME")?;
+            let dir = format!("{}/.claw/adapters/{}", home, ada.site);
+            std::fs::create_dir_all(&dir)?;
+
+            let target = format!("{}/{}.yaml", dir, ada.name);
+
+            // Backup existing version if present
+            if std::path::Path::new(&target).exists() {
+                let backup = format!("{}.bak", target);
+                std::fs::copy(&target, &backup)?;
+                eprintln!("backed up previous version to {}", backup);
+            }
+
+            std::fs::copy(&file, &target)?;
+            println!("saved {}/{} to {}", ada.site, ada.name, target);
+        }
+        Command::RollbackAdapter { site, name } => {
+            let home = std::env::var("HOME")?;
+            let target = format!("{}/.claw/adapters/{}/{}.yaml", home, site, name);
+            let backup = format!("{}.bak", target);
+
+            if !std::path::Path::new(&backup).exists() {
+                return Err(format!("no backup found: {}", backup).into());
+            }
+
+            std::fs::copy(&backup, &target)?;
+            println!("rolled back {}/{} from {}", site, name, backup);
+        }
+
+        Command::Login { site } => {
+            browser::ensure_chrome(cli.port, cli.headless).await?;
+            let ws_url = cdp::CdpClient::discover_ws_url(cli.port).await?;
+            let client = cdp::CdpClient::connect(&ws_url).await?;
+
+            let dirs = adapter_base_dirs();
+            let refs: Vec<&str> = dirs.iter().map(|s| s.as_str()).collect();
+            let url = adapter::resolve_login_url(&refs, &site);
+
+            client.navigate(&url).await?;
+            eprintln!("Opened {} — please log in the browser.", url);
+            eprintln!("Press Enter when done...");
+
+            let mut buf = String::new();
+            std::io::stdin().read_line(&mut buf)?;
+            eprintln!("Login saved. Cookie persists in ~/.claw/chrome-profile/");
+        }
+
+        Command::Adapter(raw_args) => {
+            if raw_args.len() < 2 {
+                return Err("usage: claw <site> <name> [--arg value ...]".into());
+            }
+            let site = &raw_args[0];
+            let name = &raw_args[1];
+
+            let dirs = adapter_base_dirs();
+            let refs: Vec<&str> = dirs.iter().map(|s| s.as_str()).collect();
+
+            // Try Lua adapter first, then YAML
+            let lua_path = find_lua_adapter(&refs, site, name);
+
+            if let Some(lua_path) = lua_path {
+                // Lua adapter
+                let cli_args = parse_adapter_args(&raw_args[2..]);
+
+                browser::ensure_chrome(cli.port, cli.headless).await?;
+                let ws_url = cdp::CdpClient::discover_ws_url(cli.port).await?;
+                let client = cdp::CdpClient::connect(&ws_url).await?;
+
+                let (columns, rows) =
+                    lua_adapter::execute_lua_adapter(&lua_path, client, cli_args).await?;
+                output::print_output(&columns, &rows, &cli.format)?;
+            } else {
+                // YAML adapter
+                let ada = adapter::load_adapter(&refs, site, name)?;
+
+                let mut args = HashMap::new();
+                if let Some(ref defs) = ada.args {
+                    for (key, def) in defs {
+                        if let Some(ref default) = def.default {
+                            args.insert(key.clone(), default.clone());
+                        }
+                    }
+                }
+                let cli_args = parse_adapter_args(&raw_args[2..]);
+                for (k, v) in cli_args {
+                    args.insert(k, v);
+                }
+
+                browser::ensure_chrome(cli.port, cli.headless).await?;
+                let ws_url = cdp::CdpClient::discover_ws_url(cli.port).await?;
+                let client = cdp::CdpClient::connect(&ws_url).await?;
+
+                let rows = pipeline::execute(&ada.pipeline, &client, args).await?;
+                output::print_output(&ada.columns, &rows, &cli.format)?;
+            }
         }
     }
     Ok(())
@@ -528,6 +777,19 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
 fn adapter_base_dirs() -> Vec<String> {
     let home = std::env::var("HOME").unwrap_or_default();
     vec!["adapters".to_string(), format!("{}/.claw/adapters", home)]
+}
+
+/// Search for a Lua adapter file in base directories.
+fn find_lua_adapter(base_dirs: &[&str], site: &str, name: &str) -> Option<String> {
+    for base in base_dirs {
+        let path = std::path::Path::new(base)
+            .join(site)
+            .join(format!("{}.lua", name));
+        if path.exists() {
+            return Some(path.to_string_lossy().to_string());
+        }
+    }
+    None
 }
 
 /// Parse --key value pairs from raw CLI args into a HashMap.

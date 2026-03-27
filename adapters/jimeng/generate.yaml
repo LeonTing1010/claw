@@ -1,0 +1,51 @@
+site: jimeng
+name: generate
+description: 即梦AI 文生图 — 提交 prompt 触发生成
+domain: jimeng.jianying.com
+strategy: cookie
+browser: true
+version: "5"
+last_forged: "2026-03-27"
+forged_by: "claude-opus-4"
+
+args:
+  prompt:
+    type: string
+    default: ""
+
+columns: [status, prompt]
+
+pipeline:
+  - navigate: https://jimeng.jianying.com/ai-tool/home
+  - wait_for:
+      selector: ".tiptap"
+      timeout: 20
+  - wait: 1
+
+  # 切换到图片生成模式
+  - click: "图片生成"
+  - wait: 0.5
+  - click: "图片生成"
+  - wait: 1
+
+  # 语义寻址：输入 prompt 到主输入框
+  - type:
+      target: primary_input
+      text: "${{ args.prompt }}"
+  - wait: 0.5
+
+  # 语义寻址：点击提交按钮
+  - click:
+      target: submit_button
+  - wait: 3
+
+  # 返回状态
+  - evaluate: |
+      (() => {
+        const editor = document.querySelector('.tiptap[role=textbox]');
+        const prompt = editor ? editor.textContent.trim() : '';
+        return [{ status: 'submitted', prompt: prompt.substring(0, 80) || 'sent' }];
+      })()
+  - map:
+      status: ${{ item.status }}
+      prompt: ${{ item.prompt }}

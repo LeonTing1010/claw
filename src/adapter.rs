@@ -16,6 +16,12 @@ pub struct Adapter {
     pub columns: Vec<String>,
     #[serde(deserialize_with = "deserialize_pipeline")]
     pub pipeline: Vec<PipelineStep>,
+    /// Adapter version (semver or integer)
+    pub version: Option<String>,
+    /// ISO timestamp when this adapter was last forged/updated
+    pub last_forged: Option<String>,
+    /// Who/what forged this adapter (e.g. "claude-opus-4", "human")
+    pub forged_by: Option<String>,
 }
 
 /// Defines an argument with an optional type and default value.
@@ -37,24 +43,84 @@ pub enum PipelineStep {
     Wait(String),
     Click(String),
     ClickSelector(String),
-    Type { selector: String, text: String },
-    Upload { selector: String, files: String },
-    WaitFor { selector: String, timeout: String },
-    WaitForText { text: String, timeout: String },
-    WaitForUrl { pattern: String, timeout: String },
+    /// Click resolved by semantic target name (e.g. "submit_button")
+    ClickTarget(String),
+    Type {
+        selector: Option<String>,
+        target: Option<String>,
+        text: String,
+    },
+    Upload {
+        selector: String,
+        files: String,
+    },
+    WaitFor {
+        selector: String,
+        timeout: String,
+    },
+    WaitForText {
+        text: String,
+        timeout: String,
+    },
+    WaitForUrl {
+        pattern: String,
+        timeout: String,
+    },
     WaitForNetworkIdle(String),
     Screenshot(String),
     Hover(String),
     HoverSelector(String),
     Scroll(String),
-    ScrollBy { x: String, y: String },
-    PressKey { key: String, modifiers: String },
-    Select { selector: String, value: String },
+    ScrollBy {
+        x: String,
+        y: String,
+    },
+    PressKey {
+        key: String,
+        modifiers: String,
+    },
+    Select {
+        selector: String,
+        value: String,
+    },
     DismissDialog(String),
     AssertSelector(String),
     AssertText(String),
     AssertUrl(String),
     AssertNotSelector(String),
+    /// Direct HTTP fetch without browser — Tier 1 public API path
+    Fetch {
+        url: String,
+        method: String,
+        headers: HashMap<String, String>,
+        body: Option<String>,
+    },
+    /// Extract nested data via dot-notation path (e.g. "data.items")
+    SelectPath(String),
+    /// Filter array items by expression (e.g. "item.views > 1000")
+    Filter(String),
+    /// Intercept network response matching URL pattern, triggered by an action
+    Intercept {
+        trigger: String,
+        capture: String,
+        timeout: String,
+        select: Option<String>,
+    },
+    /// Conditional: execute sub-steps if CSS selector exists
+    IfSelector {
+        selector: String,
+        then_steps: Vec<PipelineStep>,
+    },
+    /// Conditional: execute sub-steps if visible text is found
+    IfText {
+        text: String,
+        then_steps: Vec<PipelineStep>,
+    },
+    /// Conditional: execute sub-steps if URL matches pattern
+    IfUrl {
+        pattern: String,
+        then_steps: Vec<PipelineStep>,
+    },
 }
 
 /// Convert a `serde_yml::Value` to a `String`, handling both string values
@@ -123,11 +189,25 @@ where
                 })?;
                 PipelineStep::Wait(s)
             }
-            "click" => {
-                let s = yml_value_to_string(&value)
-                    .ok_or_else(|| serde::de::Error::custom("click value must be a string"))?;
-                PipelineStep::Click(s)
-            }
+            "click" => match &value {
+                serde_yml::Value::Mapping(m) => {
+                    let target = m
+                        .get(serde_yml::Value::String("target".into()))
+                        .and_then(yml_value_to_string)
+                        .ok_or_else(|| {
+                            serde::de::Error::custom("click mapping requires 'target' field")
+                        })?;
+                    PipelineStep::ClickTarget(target)
+                }
+                _ => {
+                    let s = yml_value_to_string(&value).ok_or_else(|| {
+                        serde::de::Error::custom(
+                            "click value must be a string or mapping with target",
+                        )
+                    })?;
+                    PipelineStep::Click(s)
+                }
+            },
             "click_selector" => {
                 let s = yml_value_to_string(&value).ok_or_else(|| {
                     serde::de::Error::custom("click_selector value must be a string")
@@ -145,15 +225,24 @@ where
                 };
                 let selector = mapping
                     .get(serde_yml::Value::String("selector".into()))
-                    .and_then(yml_value_to_string)
-                    .ok_or_else(|| {
-                        serde::de::Error::custom("type step requires 'selector' field")
-                    })?;
+                    .and_then(yml_value_to_string);
+                let target = mapping
+                    .get(serde_yml::Value::String("target".into()))
+                    .and_then(yml_value_to_string);
                 let text = mapping
                     .get(serde_yml::Value::String("text".into()))
                     .and_then(yml_value_to_string)
                     .ok_or_else(|| serde::de::Error::custom("type step requires 'text' field"))?;
-                PipelineStep::Type { selector, text }
+                if selector.is_none() && target.is_none() {
+                    return Err(serde::de::Error::custom(
+                        "type step requires 'selector' or 'target' field",
+                    ));
+                }
+                PipelineStep::Type {
+                    selector,
+                    target,
+                    text,
+                }
             }
             "upload" => {
                 let mapping = match &value {
@@ -263,32 +352,35 @@ where
                     }
                 }
             },
-            "select" => {
-                let mapping = match &value {
-                    serde_yml::Value::Mapping(m) => m,
-                    _ => {
-                        return Err(serde::de::Error::custom(
-                            "select value must be a mapping with selector and value",
-                        ))
+            "select" => match &value {
+                // String → data path extraction (opencli-compatible)
+                serde_yml::Value::String(s) => PipelineStep::SelectPath(s.clone()),
+                serde_yml::Value::Number(n) => PipelineStep::SelectPath(n.to_string()),
+                // Mapping with selector+value → dropdown selection (claw-native)
+                serde_yml::Value::Mapping(m) => {
+                    let selector = m
+                        .get(serde_yml::Value::String("selector".into()))
+                        .and_then(yml_value_to_string)
+                        .ok_or_else(|| {
+                            serde::de::Error::custom("select step requires 'selector' field")
+                        })?;
+                    let val = m
+                        .get(serde_yml::Value::String("value".into()))
+                        .and_then(yml_value_to_string)
+                        .ok_or_else(|| {
+                            serde::de::Error::custom("select step requires 'value' field")
+                        })?;
+                    PipelineStep::Select {
+                        selector,
+                        value: val,
                     }
-                };
-                let selector = mapping
-                    .get(serde_yml::Value::String("selector".into()))
-                    .and_then(yml_value_to_string)
-                    .ok_or_else(|| {
-                        serde::de::Error::custom("select step requires 'selector' field")
-                    })?;
-                let val = mapping
-                    .get(serde_yml::Value::String("value".into()))
-                    .and_then(yml_value_to_string)
-                    .ok_or_else(|| {
-                        serde::de::Error::custom("select step requires 'value' field")
-                    })?;
-                PipelineStep::Select {
-                    selector,
-                    value: val,
                 }
-            }
+                _ => {
+                    return Err(serde::de::Error::custom(
+                        "select value must be a path string or mapping with selector+value",
+                    ))
+                }
+            },
             "dismiss_dialog" => {
                 let s = yml_value_to_string(&value).unwrap_or_else(|| "true".to_string());
                 PipelineStep::DismissDialog(s)
@@ -368,6 +460,148 @@ where
                 })?;
                 PipelineStep::AssertNotSelector(s)
             }
+            "fetch" => match &value {
+                serde_yml::Value::String(url) => PipelineStep::Fetch {
+                    url: url.clone(),
+                    method: "GET".to_string(),
+                    headers: HashMap::new(),
+                    body: None,
+                },
+                serde_yml::Value::Mapping(m) => {
+                    let url = m
+                        .get(serde_yml::Value::String("url".into()))
+                        .and_then(yml_value_to_string)
+                        .ok_or_else(|| {
+                            serde::de::Error::custom("fetch step requires 'url' field")
+                        })?;
+                    let method = m
+                        .get(serde_yml::Value::String("method".into()))
+                        .and_then(yml_value_to_string)
+                        .unwrap_or_else(|| "GET".to_string());
+                    let body = m
+                        .get(serde_yml::Value::String("body".into()))
+                        .and_then(yml_value_to_string);
+                    let mut headers = HashMap::new();
+                    if let Some(serde_yml::Value::Mapping(hm)) =
+                        m.get(serde_yml::Value::String("headers".into()))
+                    {
+                        for (k, v) in hm {
+                            if let (Some(ks), Some(vs)) =
+                                (yml_value_to_string(k), yml_value_to_string(v))
+                            {
+                                headers.insert(ks, vs);
+                            }
+                        }
+                    }
+                    PipelineStep::Fetch {
+                        url,
+                        method,
+                        headers,
+                        body,
+                    }
+                }
+                _ => {
+                    return Err(serde::de::Error::custom(
+                        "fetch value must be a URL string or mapping",
+                    ))
+                }
+            },
+            "filter" => {
+                let s = yml_value_to_string(&value)
+                    .ok_or_else(|| serde::de::Error::custom("filter value must be a string"))?;
+                PipelineStep::Filter(s)
+            }
+            "intercept" => {
+                let mapping = match &value {
+                    serde_yml::Value::Mapping(m) => m,
+                    _ => {
+                        return Err(serde::de::Error::custom(
+                            "intercept must be a mapping with trigger and capture",
+                        ))
+                    }
+                };
+                let trigger = mapping
+                    .get(serde_yml::Value::String("trigger".into()))
+                    .and_then(yml_value_to_string)
+                    .ok_or_else(|| {
+                        serde::de::Error::custom("intercept requires 'trigger' field")
+                    })?;
+                let capture = mapping
+                    .get(serde_yml::Value::String("capture".into()))
+                    .and_then(yml_value_to_string)
+                    .ok_or_else(|| {
+                        serde::de::Error::custom("intercept requires 'capture' field")
+                    })?;
+                let timeout = mapping
+                    .get(serde_yml::Value::String("timeout".into()))
+                    .and_then(yml_value_to_string)
+                    .unwrap_or_else(|| "10".to_string());
+                let select = mapping
+                    .get(serde_yml::Value::String("select".into()))
+                    .and_then(yml_value_to_string);
+                PipelineStep::Intercept {
+                    trigger,
+                    capture,
+                    timeout,
+                    select,
+                }
+            }
+            "if_selector" => {
+                let mapping = match &value {
+                    serde_yml::Value::Mapping(m) => m,
+                    _ => {
+                        return Err(serde::de::Error::custom(
+                            "if_selector must be a mapping with selector and then",
+                        ))
+                    }
+                };
+                let selector = mapping
+                    .get(serde_yml::Value::String("selector".into()))
+                    .and_then(yml_value_to_string)
+                    .ok_or_else(|| {
+                        serde::de::Error::custom("if_selector requires 'selector' field")
+                    })?;
+                let then_steps = parse_then_steps::<D>(mapping)?;
+                PipelineStep::IfSelector {
+                    selector,
+                    then_steps,
+                }
+            }
+            "if_text" => {
+                let mapping = match &value {
+                    serde_yml::Value::Mapping(m) => m,
+                    _ => {
+                        return Err(serde::de::Error::custom(
+                            "if_text must be a mapping with text and then",
+                        ))
+                    }
+                };
+                let text = mapping
+                    .get(serde_yml::Value::String("text".into()))
+                    .and_then(yml_value_to_string)
+                    .ok_or_else(|| serde::de::Error::custom("if_text requires 'text' field"))?;
+                let then_steps = parse_then_steps::<D>(mapping)?;
+                PipelineStep::IfText { text, then_steps }
+            }
+            "if_url" => {
+                let mapping = match &value {
+                    serde_yml::Value::Mapping(m) => m,
+                    _ => {
+                        return Err(serde::de::Error::custom(
+                            "if_url must be a mapping with pattern and then",
+                        ))
+                    }
+                };
+                let pattern = mapping
+                    .get(serde_yml::Value::String("pattern".into()))
+                    .and_then(yml_value_to_string)
+                    .ok_or_else(|| serde::de::Error::custom("if_url requires 'pattern' field"))?;
+                let then_steps = parse_then_steps::<D>(mapping)?;
+                PipelineStep::IfUrl {
+                    pattern,
+                    then_steps,
+                }
+            }
             other => {
                 return Err(serde::de::Error::custom(format!(
                     "unknown pipeline step: {}",
@@ -378,6 +612,64 @@ where
         steps.push(step);
     }
     Ok(steps)
+}
+
+/// Parse the `then` sub-steps from a conditional step mapping.
+fn parse_then_steps<'de, D: serde::Deserializer<'de>>(
+    mapping: &serde_yml::Mapping,
+) -> Result<Vec<PipelineStep>, D::Error> {
+    let then_val = mapping
+        .get(serde_yml::Value::String("then".into()))
+        .ok_or_else(|| serde::de::Error::custom("conditional step requires 'then' field"))?;
+
+    let then_seq = match then_val {
+        serde_yml::Value::Sequence(seq) => seq,
+        _ => {
+            return Err(serde::de::Error::custom(
+                "'then' field must be a list of steps",
+            ))
+        }
+    };
+
+    let mut sub_steps = Vec::new();
+    for item in then_seq {
+        let item_map = match item {
+            serde_yml::Value::Mapping(m) => m,
+            _ => {
+                return Err(serde::de::Error::custom(
+                    "each step in 'then' must be a mapping",
+                ))
+            }
+        };
+        if item_map.len() != 1 {
+            return Err(serde::de::Error::custom(
+                "each step in 'then' must be a single-key map",
+            ));
+        }
+        let (k, v) = item_map.into_iter().next().unwrap();
+        let key_str = yml_value_to_string(k)
+            .ok_or_else(|| serde::de::Error::custom("step key not string"))?;
+        let val_clone = v.clone();
+        // Re-use the main pipeline parser by wrapping as a single-element list
+        let wrapper_yaml = {
+            let mut m = HashMap::new();
+            m.insert(key_str, val_clone);
+            vec![m]
+        };
+        let yaml_str = serde_yml::to_string(&wrapper_yaml).map_err(serde::de::Error::custom)?;
+        let parsed: Vec<PipelineStep> = {
+            #[derive(Deserialize)]
+            struct W {
+                #[serde(deserialize_with = "deserialize_pipeline")]
+                pipeline: Vec<PipelineStep>,
+            }
+            let full = format!("pipeline:\n{}", yaml_str);
+            let w: W = serde_yml::from_str(&full).map_err(serde::de::Error::custom)?;
+            w.pipeline
+        };
+        sub_steps.extend(parsed);
+    }
+    Ok(sub_steps)
 }
 
 /// Load an adapter by searching through the given base directories for
@@ -400,6 +692,55 @@ pub fn load_adapter(
         site, name, base_dirs
     )
     .into())
+}
+
+/// Parse a single pipeline step from a YAML string like "navigate: https://example.com".
+/// Wraps the string in a YAML list to reuse the existing pipeline deserializer.
+pub fn parse_single_step(yaml: &str) -> Result<PipelineStep, Box<dyn std::error::Error>> {
+    // Wrap as a pipeline list with one entry
+    let wrapper = format!("pipeline:\n  - {}", yaml);
+
+    #[derive(Deserialize)]
+    struct Wrapper {
+        #[serde(deserialize_with = "deserialize_pipeline")]
+        pipeline: Vec<PipelineStep>,
+    }
+
+    let w: Wrapper = serde_yml::from_str(&wrapper)?;
+    w.pipeline
+        .into_iter()
+        .next()
+        .ok_or_else(|| "empty pipeline step".into())
+}
+
+/// Resolve a site name to a login URL.
+/// If adapters exist for the site, uses the first adapter's `domain` field.
+/// Otherwise treats the input as a domain directly.
+pub fn resolve_login_url(base_dirs: &[&str], site: &str) -> String {
+    // Try to find an adapter with a domain field
+    for base in base_dirs {
+        let site_dir = Path::new(base).join(site);
+        if let Ok(entries) = std::fs::read_dir(&site_dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.extension().and_then(|e| e.to_str()) == Some("yaml") {
+                    if let Ok(content) = std::fs::read_to_string(&path) {
+                        if let Ok(adapter) = serde_yml::from_str::<Adapter>(&content) {
+                            if let Some(domain) = adapter.domain {
+                                return format!("https://{}", domain);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    // Fallback: treat input as domain
+    if site.contains('.') {
+        format!("https://{}", site)
+    } else {
+        format!("https://{}.com", site)
+    }
 }
 
 #[derive(Debug)]
@@ -464,6 +805,27 @@ pub fn list_adapters(base_dirs: &[&str]) -> Vec<AdapterInfo> {
     }
     adapters.sort_by(|a, b| (&a.site, &a.name).cmp(&(&b.site, &b.name)));
     adapters
+}
+
+/// Resolve a semantic target name to a CSS selector using explore hints.
+/// Used by tests and as a pure (non-async) resolver when hints are already available.
+pub fn resolve_target(
+    target: &str,
+    hints: &crate::cdp::ExploreHints,
+) -> Result<String, Box<dyn std::error::Error>> {
+    match target {
+        "primary_input" => hints
+            .primary_input
+            .as_ref()
+            .map(|e| e.selector.clone())
+            .ok_or_else(|| "no primary input detected on page".into()),
+        "submit_button" => hints
+            .submit_button
+            .as_ref()
+            .map(|e| e.selector.clone())
+            .ok_or_else(|| "no submit button detected on page".into()),
+        _ => Err(format!("unknown semantic target: {}", target).into()),
+    }
 }
 
 #[cfg(test)]
@@ -616,8 +978,8 @@ pipeline:
 "#;
         let adapter: Adapter = serde_yml::from_str(yaml).unwrap();
         match &adapter.pipeline[0] {
-            PipelineStep::Type { selector, text } => {
-                assert_eq!(selector, "input.title");
+            PipelineStep::Type { selector, text, .. } => {
+                assert_eq!(selector.as_deref(), Some("input.title"));
                 assert_eq!(text, "${{ args.title }}");
             }
             _ => panic!("expected Type step"),
@@ -677,5 +1039,261 @@ pipeline:
     fn list_adapters_empty_dir() {
         let adapters = list_adapters(&["/nonexistent/path"]);
         assert!(adapters.is_empty());
+    }
+
+    #[test]
+    fn parse_single_step_navigate() {
+        let step = parse_single_step("navigate: https://example.com").unwrap();
+        match step {
+            PipelineStep::Navigate(url) => assert_eq!(url, "https://example.com"),
+            _ => panic!("expected Navigate"),
+        }
+    }
+
+    #[test]
+    fn parse_single_step_click() {
+        let step = parse_single_step("click: Submit").unwrap();
+        match step {
+            PipelineStep::Click(text) => assert_eq!(text, "Submit"),
+            _ => panic!("expected Click"),
+        }
+    }
+
+    #[test]
+    fn parse_if_selector_step() {
+        let yaml = r#"
+site: test
+name: test
+columns: [status]
+pipeline:
+  - if_selector:
+      selector: ".modal"
+      then:
+        - click_selector: ".modal-close"
+        - wait: 1
+"#;
+        let adapter: Adapter = serde_yml::from_str(yaml).unwrap();
+        assert_eq!(adapter.pipeline.len(), 1);
+        match &adapter.pipeline[0] {
+            PipelineStep::IfSelector {
+                selector,
+                then_steps,
+            } => {
+                assert_eq!(selector, ".modal");
+                assert_eq!(then_steps.len(), 2);
+                match &then_steps[0] {
+                    PipelineStep::ClickSelector(s) => assert_eq!(s, ".modal-close"),
+                    _ => panic!("expected ClickSelector in then"),
+                }
+            }
+            _ => panic!("expected IfSelector"),
+        }
+    }
+
+    #[test]
+    fn parse_if_text_step() {
+        let yaml = r#"
+site: test
+name: test
+columns: [status]
+pipeline:
+  - if_text:
+      text: "验证码"
+      then:
+        - screenshot: /tmp/captcha.png
+"#;
+        let adapter: Adapter = serde_yml::from_str(yaml).unwrap();
+        match &adapter.pipeline[0] {
+            PipelineStep::IfText { text, then_steps } => {
+                assert_eq!(text, "验证码");
+                assert_eq!(then_steps.len(), 1);
+            }
+            _ => panic!("expected IfText"),
+        }
+    }
+
+    #[test]
+    fn parse_adapter_metadata() {
+        let yaml = r#"
+site: test
+name: test
+version: "1.2"
+last_forged: "2026-03-27T10:00:00Z"
+forged_by: "claude-opus-4"
+columns: [status]
+pipeline:
+  - navigate: https://example.com
+"#;
+        let adapter: Adapter = serde_yml::from_str(yaml).unwrap();
+        assert_eq!(adapter.version, Some("1.2".to_string()));
+        assert_eq!(
+            adapter.last_forged,
+            Some("2026-03-27T10:00:00Z".to_string())
+        );
+        assert_eq!(adapter.forged_by, Some("claude-opus-4".to_string()));
+    }
+
+    #[test]
+    fn parse_assert_steps() {
+        let yaml = r#"
+site: test
+name: test
+columns: [status]
+pipeline:
+  - assert_selector: ".success"
+  - assert_text: "Published"
+  - assert_url: "/dashboard"
+  - assert_not_selector: ".error"
+"#;
+        let adapter: Adapter = serde_yml::from_str(yaml).unwrap();
+        assert_eq!(adapter.pipeline.len(), 4);
+        match &adapter.pipeline[0] {
+            PipelineStep::AssertSelector(s) => assert_eq!(s, ".success"),
+            _ => panic!("expected AssertSelector"),
+        }
+        match &adapter.pipeline[1] {
+            PipelineStep::AssertText(t) => assert_eq!(t, "Published"),
+            _ => panic!("expected AssertText"),
+        }
+    }
+
+    // ---- semantic targeting: adapter steps address elements by role, not selector ----
+    // Classification: quality, what — semantic targets survive website rebuilds
+    // Why: CSS selectors break on every deploy; semantic targets ("primary_input") don't
+
+    #[test]
+    fn parse_type_step_with_semantic_target() {
+        let yaml = r#"
+site: test
+name: test
+columns: [status]
+pipeline:
+  - type:
+      target: primary_input
+      text: "${{ args.prompt }}"
+"#;
+        let adapter: Adapter = serde_yml::from_str(yaml).unwrap();
+        match &adapter.pipeline[0] {
+            PipelineStep::Type {
+                selector,
+                target,
+                text,
+            } => {
+                assert!(
+                    selector.is_none(),
+                    "selector should be None when target is used"
+                );
+                assert_eq!(target.as_deref(), Some("primary_input"));
+                assert_eq!(text, "${{ args.prompt }}");
+            }
+            _ => panic!("expected Type step"),
+        }
+    }
+
+    #[test]
+    fn parse_click_step_with_semantic_target() {
+        let yaml = r#"
+site: test
+name: test
+columns: [status]
+pipeline:
+  - click:
+      target: submit_button
+"#;
+        let adapter: Adapter = serde_yml::from_str(yaml).unwrap();
+        match &adapter.pipeline[0] {
+            PipelineStep::Click(text) => {
+                // click with target should not be parsed as Click(text)
+                panic!("should not be Click(text), got: {}", text);
+            }
+            PipelineStep::ClickTarget(target) => {
+                assert_eq!(target, "submit_button");
+            }
+            _ => panic!("expected ClickTarget step"),
+        }
+    }
+
+    #[test]
+    fn parse_type_step_with_selector_still_works() {
+        // Backwards compatibility: selector-based steps must still parse
+        let yaml = r#"
+site: test
+name: test
+columns: [status]
+pipeline:
+  - type:
+      selector: "input.title"
+      text: "${{ args.title }}"
+"#;
+        let adapter: Adapter = serde_yml::from_str(yaml).unwrap();
+        match &adapter.pipeline[0] {
+            PipelineStep::Type {
+                selector,
+                target,
+                text,
+            } => {
+                assert_eq!(selector.as_deref(), Some("input.title"));
+                assert!(target.is_none());
+                assert_eq!(text, "${{ args.title }}");
+            }
+            _ => panic!("expected Type step"),
+        }
+    }
+
+    #[test]
+    fn resolve_semantic_target_primary_input() {
+        // Why: runtime resolution must map "primary_input" → actual selector from hints
+        use crate::cdp::{ElementType, ExploreHints, InteractiveElement};
+        let hints = ExploreHints {
+            primary_input: Some(InteractiveElement {
+                tag: "div".to_string(),
+                role: "textbox".to_string(),
+                text: "Enter prompt".to_string(),
+                selector: "div.tiptap".to_string(),
+                x: 400,
+                y: 200,
+                width: 900,
+                height: 96,
+                element_type: ElementType::Textarea,
+            }),
+            submit_button: None,
+        };
+        assert_eq!(
+            resolve_target("primary_input", &hints).unwrap(),
+            "div.tiptap"
+        );
+    }
+
+    #[test]
+    fn resolve_semantic_target_submit_button() {
+        use crate::cdp::{ElementType, ExploreHints, InteractiveElement};
+        let hints = ExploreHints {
+            primary_input: None,
+            submit_button: Some(InteractiveElement {
+                tag: "button".to_string(),
+                role: "button".to_string(),
+                text: "".to_string(),
+                selector: "button.lv-btn".to_string(),
+                x: 1095,
+                y: 317,
+                width: 36,
+                height: 36,
+                element_type: ElementType::Button,
+            }),
+        };
+        assert_eq!(
+            resolve_target("submit_button", &hints).unwrap(),
+            "button.lv-btn"
+        );
+    }
+
+    #[test]
+    fn resolve_unknown_target_fails() {
+        use crate::cdp::ExploreHints;
+        let hints = ExploreHints {
+            primary_input: None,
+            submit_button: None,
+        };
+        assert!(resolve_target("nonexistent", &hints).is_err());
     }
 }

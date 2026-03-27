@@ -18,3 +18,5 @@ regex = "1.12"
 tabled = "0.20"
 futures-util = "0.3.32"
 base64 = "0.22.1"
+mlua = { version = "0.10", features = ["lua54", "vendored", "async", "send"] }
+reqwest = { version = "0.12", features = ["json"] }

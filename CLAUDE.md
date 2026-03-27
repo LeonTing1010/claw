@@ -86,4 +86,4 @@ Business logic tests should be named descriptively: `{module}_{what_it_verifies}
 
 ## Status
 
-Phase 1 complete: CDP client, YAML adapter pipeline, native click/type/upload (precision execution layer). Next: Phase 2 — forge toolkit (screenshot, read-dom, explore, record) to enable agent-driven adapter creation. See `.claude/DESIGN.md` for the full technical design and philosophy.
+Phases 1-5 complete (55 tests passing). Full stack: CDP precision execution + forge toolkit (28 scalpels) + meta-tools (try-step, verify-adapter) + adapter expressiveness (conditionals, assertions) + MCP server (`claw mcp`, 26 tools) + adapter versioning (save/rollback) + Lua runtime (mlua, 18 page API methods). 34 CLI subcommands. Remaining: docs + crates.io release. See `.claude/DESIGN.md` for full design and philosophy.

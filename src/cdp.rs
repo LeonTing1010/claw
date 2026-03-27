@@ -45,10 +45,143 @@ impl std::error::Error for CdpError {}
 
 type PendingMap = Arc<Mutex<HashMap<u64, oneshot::Sender<Result<Value, CdpError>>>>>;
 
+/// A captured network request/response pair from CDP Network domain.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct NetworkEntry {
+    pub request_id: String,
+    pub url: String,
+    pub method: String,
+    pub status: u16,
+    pub mime_type: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub request_headers: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub response_headers: Option<Value>,
+    /// Populated on demand via Network.getResponseBody
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub body: Option<Value>,
+}
+
+type NetworkLog = Arc<Mutex<Vec<NetworkEntry>>>;
+/// Pending requests (requestWillBeSent but not yet responseReceived)
+type PendingRequests = Arc<Mutex<HashMap<String, (String, String, Option<Value>)>>>; // requestId → (url, method, headers)
+
+/// Type of interactive element detected during explore.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum ElementType {
+    Button,
+    Link,
+    Input,
+    Textarea,
+    Select,
+    Checkbox,
+    Radio,
+    ContentEditable,
+    Other,
+}
+
+/// A single interactive element found on the page.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct InteractiveElement {
+    pub tag: String,
+    pub role: String,
+    pub text: String,
+    pub selector: String,
+    pub x: i32,
+    pub y: i32,
+    pub width: i32,
+    pub height: i32,
+    pub element_type: ElementType,
+}
+
+/// A form field detected on the page.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct FormField {
+    pub selector: String,
+    pub field_type: String,
+    pub name: String,
+    pub placeholder: String,
+}
+
+/// A form detected on the page.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct FormInfo {
+    pub selector: String,
+    pub fields: Vec<FormField>,
+    pub submit_selector: Option<String>,
+}
+
+/// Heuristic hints: auto-detected primary input, submit button, etc.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct ExploreHints {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub primary_input: Option<InteractiveElement>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub submit_button: Option<InteractiveElement>,
+}
+
+impl ExploreHints {
+    pub fn from_elements(elements: &[InteractiveElement]) -> Self {
+        // Primary input: largest textarea/input/contenteditable by area
+        let primary_input = elements
+            .iter()
+            .filter(|e| {
+                matches!(
+                    e.element_type,
+                    ElementType::Textarea | ElementType::Input | ElementType::ContentEditable
+                )
+            })
+            .max_by_key(|e| e.width * e.height)
+            .cloned();
+
+        // Submit button: button closest to primary input
+        let submit_button = if let Some(ref input) = primary_input {
+            elements
+                .iter()
+                .filter(|e| e.element_type == ElementType::Button)
+                .min_by_key(|b| {
+                    let dx = (b.x - input.x) as i64;
+                    let dy = (b.y - input.y) as i64;
+                    dx * dx + dy * dy
+                })
+                .cloned()
+        } else {
+            None
+        };
+
+        ExploreHints {
+            primary_input,
+            submit_button,
+        }
+    }
+}
+
+/// Full page panorama returned by `explore` — everything an Agent needs to forge an adapter.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct ExploreResult {
+    pub url: String,
+    pub title: String,
+    pub screenshot_path: String,
+    pub logged_in: bool,
+    pub interactive_elements: Vec<InteractiveElement>,
+    pub forms: Vec<FormInfo>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hints: Option<ExploreHints>,
+}
+
+#[derive(Clone)]
 pub struct CdpClient {
     tx: mpsc::Sender<Message>,
     pending: PendingMap,
     next_id: Arc<Mutex<u64>>,
+    /// Network entries captured via CDP Network domain events
+    network_log: NetworkLog,
+    /// In-flight requests awaiting response (written by read_loop via Arc clone)
+    #[allow(dead_code)]
+    pending_requests: PendingRequests,
+    /// Whether network capture is active
+    network_capture_active: Arc<Mutex<bool>>,
 }
 
 /// Build Input.dispatchMouseEvent params
@@ -62,7 +195,14 @@ fn mouse_event_params(event_type: &str, x: f64, y: f64) -> Value {
     })
 }
 
+/// Produce a valid JavaScript string literal (double-quoted, properly escaped).
+/// Uses JSON serialization which handles all special characters correctly.
+pub(crate) fn js_str(s: &str) -> String {
+    serde_json::to_string(s).unwrap_or_else(|_| format!("\"{}\"", s))
+}
+
 /// Escape a string for safe embedding in JavaScript single-quoted strings
+/// DEPRECATED: use js_str() instead — this breaks when input contains single quotes
 pub(crate) fn escape_js_string(s: &str) -> String {
     s.replace('\\', "\\\\")
         .replace('\'', "\\'")
@@ -92,6 +232,9 @@ impl CdpClient {
         let (write, read) = ws_stream.split();
 
         let pending: PendingMap = Arc::new(Mutex::new(HashMap::new()));
+        let network_log: NetworkLog = Arc::new(Mutex::new(Vec::new()));
+        let pending_requests: PendingRequests = Arc::new(Mutex::new(HashMap::new()));
+        let network_capture_active: Arc<Mutex<bool>> = Arc::new(Mutex::new(false));
         let (tx, mut rx) = mpsc::channel::<Message>(64);
 
         // Writer task: forward messages from channel to WebSocket
@@ -104,22 +247,38 @@ impl CdpClient {
             }
         });
 
-        // Reader task: route responses to pending callers
+        // Reader task: route responses and network events
         let pending_clone = pending.clone();
+        let net_log_clone = network_log.clone();
+        let pending_req_clone = pending_requests.clone();
+        let net_active_clone = network_capture_active.clone();
         tokio::spawn(async move {
-            Self::read_loop(read, pending_clone).await;
+            Self::read_loop(
+                read,
+                pending_clone,
+                net_log_clone,
+                pending_req_clone,
+                net_active_clone,
+            )
+            .await;
         });
 
         Ok(Self {
             tx,
             pending,
             next_id: Arc::new(Mutex::new(1)),
+            network_log,
+            pending_requests,
+            network_capture_active,
         })
     }
 
     async fn read_loop(
         mut read: futures_util::stream::SplitStream<WebSocketStream<MaybeTlsStream<TcpStream>>>,
         pending: PendingMap,
+        network_log: NetworkLog,
+        pending_requests: PendingRequests,
+        network_capture_active: Arc<Mutex<bool>>,
     ) {
         while let Some(Ok(msg)) = read.next().await {
             let Message::Text(text) = msg else {
@@ -131,11 +290,62 @@ impl CdpClient {
                 Err(_) => continue,
             };
 
-            // Events (no id) are ignored for now
-            let Some(id) = resp.id else {
-                continue;
-            };
+            // Handle CDP events (no id)
+            if resp.id.is_none() {
+                if let Some(method) = &resp.method {
+                    let active = *network_capture_active.lock().await;
+                    if active {
+                        let params = resp.params.as_ref().cloned().unwrap_or(Value::Null);
+                        match method.as_str() {
+                            "Network.requestWillBeSent" => {
+                                let request_id =
+                                    params["requestId"].as_str().unwrap_or("").to_string();
+                                let url =
+                                    params["request"]["url"].as_str().unwrap_or("").to_string();
+                                let method = params["request"]["method"]
+                                    .as_str()
+                                    .unwrap_or("GET")
+                                    .to_string();
+                                let headers = params["request"].get("headers").cloned();
+                                if !request_id.is_empty() {
+                                    pending_requests
+                                        .lock()
+                                        .await
+                                        .insert(request_id, (url, method, headers));
+                                }
+                            }
+                            "Network.responseReceived" => {
+                                let request_id =
+                                    params["requestId"].as_str().unwrap_or("").to_string();
+                                let response = &params["response"];
+                                let status = response["status"].as_u64().unwrap_or(0) as u16;
+                                let mime_type =
+                                    response["mimeType"].as_str().unwrap_or("").to_string();
+                                let response_headers = response.get("headers").cloned();
 
+                                if let Some((url, method, request_headers)) =
+                                    pending_requests.lock().await.remove(&request_id)
+                                {
+                                    network_log.lock().await.push(NetworkEntry {
+                                        request_id,
+                                        url,
+                                        method,
+                                        status,
+                                        mime_type,
+                                        request_headers,
+                                        response_headers,
+                                        body: None, // populated on demand
+                                    });
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                continue;
+            }
+
+            let id = resp.id.unwrap();
             let mut map = pending.lock().await;
             if let Some(sender) = map.remove(&id) {
                 let result = match resp.error {
@@ -183,15 +393,23 @@ impl CdpClient {
     }
 
     /// Navigate to a URL and wait for the page to load.
+    /// Polls document.readyState until "complete" or timeout (30s).
     pub async fn navigate(&self, url: &str) -> Result<(), Box<dyn std::error::Error>> {
         self.send("Page.enable", None).await?;
 
         self.send("Page.navigate", Some(serde_json::json!({ "url": url })))
             .await?;
 
-        // Wait for load event
-        // TODO: use event listener instead of polling
-        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        // Wait for document.readyState === "complete" (up to 30s)
+        for _ in 0..60 {
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            if let Ok(val) = self.evaluate("document.readyState").await {
+                if val == "complete" {
+                    return Ok(());
+                }
+            }
+        }
+        // Timeout — proceed anyway (page may still be usable)
         Ok(())
     }
 
@@ -235,51 +453,148 @@ impl CdpClient {
         Ok(())
     }
 
-    /// Click element matching CSS selector — resolve coordinates, then CDP click
+    // ================================================================
+    // Pure-CDP DOM helpers — no JS injection
+    // ================================================================
+
+    /// Resolve a CSS selector to a DOM nodeId via pure CDP calls.
+    /// Enables `DOM` domain, gets the document root, then queries.
+    async fn resolve_selector(&self, selector: &str) -> Result<i64, Box<dyn std::error::Error>> {
+        self.send("DOM.enable", None).await?;
+        let doc = self
+            .send("DOM.getDocument", Some(serde_json::json!({"depth": 0})))
+            .await?;
+        let root_id = doc["root"]["nodeId"]
+            .as_i64()
+            .ok_or("missing root nodeId")?;
+        let node = self
+            .send(
+                "DOM.querySelector",
+                Some(serde_json::json!({
+                    "nodeId": root_id,
+                    "selector": selector
+                })),
+            )
+            .await?;
+        let node_id = node["nodeId"]
+            .as_i64()
+            .filter(|&id| id != 0)
+            .ok_or_else(|| format!("element not found: {}", selector))?;
+        Ok(node_id)
+    }
+
+    /// Get the center (x, y) of an element's box model via pure CDP.
+    /// Uses `DOM.getBoxModel` — no `getBoundingClientRect()` JS injection.
+    async fn get_box_center(&self, node_id: i64) -> Result<(f64, f64), Box<dyn std::error::Error>> {
+        let box_model = self
+            .send(
+                "DOM.getBoxModel",
+                Some(serde_json::json!({"nodeId": node_id})),
+            )
+            .await?;
+        // content quad is [x1,y1, x2,y2, x3,y3, x4,y4] — four corners
+        let content = box_model["model"]["content"]
+            .as_array()
+            .ok_or("missing box model content quad")?;
+        if content.len() < 8 {
+            return Err("box model content quad has fewer than 8 values".into());
+        }
+        let (mut sum_x, mut sum_y) = (0.0, 0.0);
+        for i in 0..4 {
+            sum_x += content[i * 2].as_f64().unwrap_or(0.0);
+            sum_y += content[i * 2 + 1].as_f64().unwrap_or(0.0);
+        }
+        let cx = sum_x / 4.0;
+        let cy = sum_y / 4.0;
+        if cx == 0.0 && cy == 0.0 {
+            return Err("element not visible (zero-size box)".into());
+        }
+        Ok((cx, cy))
+    }
+
+    /// Resolve a CSS selector to its center coordinates via pure CDP.
+    async fn resolve_selector_center(
+        &self,
+        selector: &str,
+    ) -> Result<(f64, f64), Box<dyn std::error::Error>> {
+        let node_id = self.resolve_selector(selector).await?;
+        // Scroll into view first so coordinates are within viewport
+        let _ = self
+            .send(
+                "DOM.scrollIntoViewIfNeeded",
+                Some(serde_json::json!({"nodeId": node_id})),
+            )
+            .await;
+        self.get_box_center(node_id).await
+    }
+
+    /// Click element matching CSS selector — pure CDP: resolve via DOM domain, then click
     pub async fn click_selector(&self, selector: &str) -> Result<(), Box<dyn std::error::Error>> {
-        let js = format!(
-            r#"(() => {{
-                const el = document.querySelector('{}');
-                if (!el) throw new Error('element not found: {}');
-                const r = el.getBoundingClientRect();
-                if (r.width === 0 && r.height === 0) throw new Error('element not visible: {}');
-                return {{ x: r.x + r.width/2, y: r.y + r.height/2 }};
-            }})()"#,
-            escape_js_string(selector),
-            escape_js_string(selector),
-            escape_js_string(selector)
-        );
-        let result = self.evaluate(&js).await?;
-        let x = result["x"].as_f64().ok_or("missing x coordinate")?;
-        let y = result["y"].as_f64().ok_or("missing y coordinate")?;
+        let (x, y) = self.resolve_selector_center(selector).await?;
         self.click(x, y).await
     }
 
-    /// Click element containing specific visible text
+    /// Click element containing specific visible text — pure CDP via DOM.performSearch (XPath)
     pub async fn click_text(&self, text: &str) -> Result<(), Box<dyn std::error::Error>> {
-        let js = format!(
-            r#"(() => {{
-                const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
-                while (walker.nextNode()) {{
-                    if (walker.currentNode.textContent.trim().includes('{}')) {{
-                        const el = walker.currentNode.parentElement;
-                        if (el && el.offsetParent !== null) {{
-                            const r = el.getBoundingClientRect();
-                            if (r.width > 0 && r.height > 0) {{
-                                return {{ x: r.x + r.width/2, y: r.y + r.height/2 }};
-                            }}
-                        }}
-                    }}
-                }}
-                throw new Error('text not found: {}');
-            }})()"#,
-            escape_js_string(text),
-            escape_js_string(text)
-        );
-        let result = self.evaluate(&js).await?;
-        let x = result["x"].as_f64().ok_or("missing x coordinate")?;
-        let y = result["y"].as_f64().ok_or("missing y coordinate")?;
-        self.click(x, y).await
+        self.send("DOM.enable", None).await?;
+        // XPath: find text nodes containing the target string, return their parent elements
+        let escaped = text.replace('\'', "\\'");
+        let xpath = format!("//*[contains(text(), '{}')]", escaped);
+        let search = self
+            .send(
+                "DOM.performSearch",
+                Some(serde_json::json!({"query": xpath})),
+            )
+            .await?;
+        let search_id = search["searchId"]
+            .as_str()
+            .ok_or("DOM.performSearch returned no searchId")?;
+        let count = search["resultCount"].as_i64().unwrap_or(0);
+        if count == 0 {
+            let _ = self
+                .send(
+                    "DOM.discardSearchResults",
+                    Some(serde_json::json!({"searchId": search_id})),
+                )
+                .await;
+            return Err(format!("text not found: {}", text).into());
+        }
+        let results = self
+            .send(
+                "DOM.getSearchResults",
+                Some(serde_json::json!({
+                    "searchId": search_id,
+                    "fromIndex": 0,
+                    "toIndex": count.min(10)
+                })),
+            )
+            .await?;
+        let _ = self
+            .send(
+                "DOM.discardSearchResults",
+                Some(serde_json::json!({"searchId": search_id})),
+            )
+            .await;
+        let node_ids = results["nodeIds"]
+            .as_array()
+            .ok_or("missing nodeIds from search")?;
+        // Try each matching node — pick the first one with a visible box
+        for node_val in node_ids {
+            let node_id = node_val.as_i64().unwrap_or(0);
+            if node_id == 0 {
+                continue;
+            }
+            let _ = self
+                .send(
+                    "DOM.scrollIntoViewIfNeeded",
+                    Some(serde_json::json!({"nodeId": node_id})),
+                )
+                .await;
+            if let Ok((x, y)) = self.get_box_center(node_id).await {
+                return self.click(x, y).await;
+            }
+        }
+        Err(format!("text found but no visible element: {}", text).into())
     }
 
     /// Type text character by character via CDP native keyboard events.
@@ -356,37 +671,21 @@ impl CdpClient {
         self.type_text(text).await
     }
 
-    /// Upload files to a file input element via CDP.
+    /// Upload files to a file input element — pure CDP via DOM.querySelector
     pub async fn upload_files(
         &self,
         selector: &str,
         paths: &[&str],
     ) -> Result<(), Box<dyn std::error::Error>> {
-        // Use Runtime.evaluate to get the RemoteObjectId, then resolve to DOM node
-        let js = format!("document.querySelector('{}')", escape_js_string(selector));
-        let result = self
-            .send(
-                "Runtime.evaluate",
-                Some(serde_json::json!({
-                    "expression": js
-                })),
-            )
-            .await?;
-
-        let object_id = result["result"]["objectId"]
-            .as_str()
-            .ok_or(format!("element not found for upload: {}", selector))?;
-
-        // Resolve RemoteObject to DOM node
-        let dom_node = self
+        let node_id = self.resolve_selector(selector).await?;
+        // DOM.describeNode with nodeId to get backendNodeId for setFileInputFiles
+        let desc = self
             .send(
                 "DOM.describeNode",
-                Some(serde_json::json!({
-                    "objectId": object_id
-                })),
+                Some(serde_json::json!({"nodeId": node_id})),
             )
             .await?;
-        let backend_node_id = dom_node["node"]["backendNodeId"]
+        let backend_node_id = desc["node"]["backendNodeId"]
             .as_i64()
             .ok_or("failed to resolve DOM node for upload")?;
 
@@ -401,28 +700,32 @@ impl CdpClient {
         Ok(())
     }
 
-    /// Wait for a CSS selector to appear in the DOM, polling every 500ms.
+    /// Wait for a CSS selector to appear in the DOM — pure CDP polling via DOM.querySelector.
     pub async fn wait_for_selector(
         &self,
         selector: &str,
         timeout_secs: f64,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        let js = format!(
-            "document.querySelector('{}') !== null",
-            escape_js_string(selector)
-        );
         let max_attempts = (timeout_secs * 2.0) as u32; // 500ms per attempt
-        for _ in 0..max_attempts {
-            if let Ok(val) = self.evaluate(&js).await {
-                if val == true {
-                    return Ok(());
+        for attempt in 0..max_attempts {
+            match self.resolve_selector(selector).await {
+                Ok(_) => return Ok(()),
+                Err(e) => {
+                    if attempt < 3 {
+                        eprintln!("  wait_for poll {}: {}", attempt, e);
+                    }
                 }
             }
             tokio::time::sleep(std::time::Duration::from_millis(500)).await;
         }
+        // Capture page state for diagnostics (this one keeps JS — it's diagnostic only)
+        let diag = match self.evaluate("JSON.stringify({url: location.href, ready: document.readyState, title: document.title})").await {
+            Ok(v) => v.as_str().unwrap_or("unknown").to_string(),
+            Err(_) => "page unreachable".to_string(),
+        };
         Err(format!(
-            "timeout waiting for selector '{}' after {}s",
-            selector, timeout_secs
+            "timeout waiting for selector '{}' after {}s (page: {})",
+            selector, timeout_secs, diag
         )
         .into())
     }
@@ -508,13 +811,12 @@ impl CdpClient {
                 if (ch.length > 0) n.children = ch;
                 return n;
             }}
-            const root = document.querySelector('{}');
-            if (!root) throw new Error('selector not found: {}');
-            return walk(root, 0, {});
+            const root = document.querySelector({r});
+            if (!root) throw new Error('selector not found: ' + {r});
+            return walk(root, 0, {depth});
         }})()"#,
-            escape_js_string(root),
-            escape_js_string(root),
-            depth
+            r = js_str(root),
+            depth = depth
         );
         self.evaluate(&js).await
     }
@@ -555,10 +857,12 @@ impl CdpClient {
         role: Option<&str>,
     ) -> Result<Value, Box<dyn std::error::Error>> {
         let role_filter = role.unwrap_or("");
+        let q = js_str(text);
+        let rf = js_str(role_filter);
         let js = format!(
             r#"(() => {{
-            const query = '{}';
-            const roleFilter = '{}';
+            const query = {q};
+            const roleFilter = {rf};
             const results = [];
             const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_ELEMENT);
             while (walker.nextNode()) {{
@@ -592,8 +896,6 @@ impl CdpClient {
             }}
             return results;
         }})()"#,
-            escape_js_string(text),
-            escape_js_string(role_filter)
         );
         self.evaluate(&js).await
     }
@@ -603,10 +905,11 @@ impl CdpClient {
         &self,
         selector: &str,
     ) -> Result<Value, Box<dyn std::error::Error>> {
+        let s = js_str(selector);
         let js = format!(
             r#"(() => {{
-            const el = document.querySelector('{}');
-            if (!el) throw new Error('element not found: {}');
+            const el = document.querySelector({s});
+            if (!el) throw new Error('element not found: ' + {s});
             const rect = el.getBoundingClientRect();
             const cs = getComputedStyle(el);
             const attrs = {{}};
@@ -628,28 +931,26 @@ impl CdpClient {
                 zIndex: cs.zIndex
             }};
         }})()"#,
-            escape_js_string(selector),
-            escape_js_string(selector)
         );
         self.evaluate(&js).await
     }
 
-    /// Get event listeners attached to an element.
+    /// Get event listeners attached to an element — pure CDP via DOM.resolveNode
     pub async fn get_event_listeners(
         &self,
         selector: &str,
     ) -> Result<Value, Box<dyn std::error::Error>> {
-        // First get the RemoteObject for the element
-        let js = format!("document.querySelector('{}')", escape_js_string(selector));
-        let result = self
+        let node_id = self.resolve_selector(selector).await?;
+        // Resolve DOM nodeId to a Runtime RemoteObject to get objectId
+        let resolved = self
             .send(
-                "Runtime.evaluate",
-                Some(serde_json::json!({ "expression": js })),
+                "DOM.resolveNode",
+                Some(serde_json::json!({"nodeId": node_id})),
             )
             .await?;
-        let object_id = result["result"]["objectId"]
+        let object_id = resolved["object"]["objectId"]
             .as_str()
-            .ok_or(format!("element not found: {}", selector))?;
+            .ok_or(format!("failed to resolve node to object: {}", selector))?;
 
         let listeners = self
             .send(
@@ -717,33 +1018,14 @@ impl CdpClient {
         }
     }
 
-    /// Force pseudo-state (:hover, :focus, :active) on an element.
+    /// Force pseudo-state (:hover, :focus, :active) on an element — pure CDP
     pub async fn force_pseudo_state(
         &self,
         selector: &str,
         states: &[&str],
     ) -> Result<(), Box<dyn std::error::Error>> {
         self.send("CSS.enable", None).await?;
-        self.send("DOM.enable", None).await?;
-
-        // Get the DOM nodeId
-        let doc = self.send("DOM.getDocument", None).await?;
-        let root_id = doc["root"]["nodeId"]
-            .as_i64()
-            .ok_or("missing root nodeId")?;
-        let node = self
-            .send(
-                "DOM.querySelector",
-                Some(serde_json::json!({
-                    "nodeId": root_id,
-                    "selector": selector
-                })),
-            )
-            .await?;
-        let node_id = node["nodeId"]
-            .as_i64()
-            .ok_or(format!("element not found: {}", selector))?;
-
+        let node_id = self.resolve_selector(selector).await?;
         self.send(
             "CSS.forcePseudoState",
             Some(serde_json::json!({
@@ -755,59 +1037,77 @@ impl CdpClient {
         Ok(())
     }
 
-    /// Start network logging by injecting fetch/XHR monitors.
+    /// Start network capture via CDP Network domain — pure protocol, no JS injection.
+    /// Captures all fetch/XHR/navigation requests at the protocol level.
     pub async fn start_network_log(&self) -> Result<(), Box<dyn std::error::Error>> {
-        self.evaluate(
-            r#"(() => {
-            if (window.__claw_net) return 'already started';
-            window.__claw_net = [];
-            const origFetch = window.fetch;
-            window.fetch = async function(...args) {
-                const url = typeof args[0] === 'string' ? args[0] : args[0]?.url || '';
-                const method = args[1]?.method || 'GET';
-                const entry = { type: 'fetch', method, url, time: Date.now() };
-                try {
-                    const resp = await origFetch.apply(this, args);
-                    entry.status = resp.status;
-                    window.__claw_net.push(entry);
-                    return resp;
-                } catch(e) {
-                    entry.error = e.message;
-                    window.__claw_net.push(entry);
-                    throw e;
-                }
-            };
-            const origOpen = XMLHttpRequest.prototype.open;
-            const origSend = XMLHttpRequest.prototype.send;
-            XMLHttpRequest.prototype.open = function(method, url) {
-                this.__claw = { type: 'xhr', method, url: String(url), time: Date.now() };
-                return origOpen.apply(this, arguments);
-            };
-            XMLHttpRequest.prototype.send = function() {
-                const entry = this.__claw;
-                this.addEventListener('loadend', function() {
-                    entry.status = this.status;
-                    window.__claw_net.push(entry);
-                });
-                return origSend.apply(this, arguments);
-            };
-            return 'started';
-        })()"#,
-        )
-        .await?;
+        *self.network_capture_active.lock().await = true;
+        self.send("Network.enable", None).await?;
+        Ok(())
+    }
+
+    /// Stop network capture.
+    pub async fn stop_network_log(&self) -> Result<(), Box<dyn std::error::Error>> {
+        *self.network_capture_active.lock().await = false;
+        self.send("Network.disable", None).await?;
         Ok(())
     }
 
     /// Get captured network log entries and clear the buffer.
+    /// Returns full request/response metadata (URL, method, status, headers, mime type).
     pub async fn get_network_log(&self) -> Result<Value, Box<dyn std::error::Error>> {
-        self.evaluate(
-            r#"(() => {
-            const log = window.__claw_net || [];
-            window.__claw_net = [];
-            return log;
-        })()"#,
-        )
-        .await
+        let entries: Vec<NetworkEntry> = {
+            let mut log = self.network_log.lock().await;
+            log.drain(..).collect()
+        };
+        Ok(serde_json::to_value(&entries)?)
+    }
+
+    /// Get captured network log with response bodies for API responses (JSON/text).
+    /// Fetches body via Network.getResponseBody for each entry matching the filter.
+    pub async fn get_network_log_with_bodies(
+        &self,
+        url_filter: Option<&str>,
+    ) -> Result<Value, Box<dyn std::error::Error>> {
+        let entries: Vec<NetworkEntry> = {
+            let log = self.network_log.lock().await;
+            log.clone()
+        };
+
+        let mut enriched = Vec::new();
+        for mut entry in entries {
+            // Filter by URL pattern if provided
+            if let Some(filter) = url_filter {
+                if !entry.url.contains(filter) {
+                    continue;
+                }
+            }
+            // Skip non-API responses (images, fonts, CSS, etc.)
+            let dominated_by_api = entry.mime_type.contains("json")
+                || entry.mime_type.contains("text")
+                || entry.mime_type.contains("javascript");
+            if !dominated_by_api {
+                continue;
+            }
+            // Fetch response body via CDP
+            if let Ok(body_result) = self
+                .send(
+                    "Network.getResponseBody",
+                    Some(serde_json::json!({"requestId": entry.request_id})),
+                )
+                .await
+            {
+                let body_str = body_result["body"].as_str().unwrap_or("");
+                // Try to parse as JSON for structured data
+                if let Ok(json_body) = serde_json::from_str::<Value>(body_str) {
+                    entry.body = Some(json_body);
+                } else {
+                    entry.body = Some(Value::String(body_str.chars().take(2000).collect()));
+                }
+            }
+            enriched.push(entry);
+        }
+
+        Ok(serde_json::to_value(&enriched)?)
     }
 
     // ================================================================
@@ -828,54 +1128,44 @@ impl CdpClient {
         Ok(())
     }
 
-    /// Hover over element matching CSS selector.
+    /// Hover over element matching CSS selector — pure CDP
     pub async fn hover_selector(&self, selector: &str) -> Result<(), Box<dyn std::error::Error>> {
-        let js = format!(
-            r#"(() => {{
-                const el = document.querySelector('{}');
-                if (!el) throw new Error('element not found: {}');
-                const r = el.getBoundingClientRect();
-                if (r.width === 0 && r.height === 0) throw new Error('element not visible: {}');
-                return {{ x: r.x + r.width/2, y: r.y + r.height/2 }};
-            }})()"#,
-            escape_js_string(selector),
-            escape_js_string(selector),
-            escape_js_string(selector)
-        );
-        let result = self.evaluate(&js).await?;
-        let x = result["x"].as_f64().ok_or("missing x coordinate")?;
-        let y = result["y"].as_f64().ok_or("missing y coordinate")?;
+        let (x, y) = self.resolve_selector_center(selector).await?;
         self.hover_at(x, y).await
     }
 
-    /// Scroll an element into view.
+    /// Scroll an element into view — pure CDP via DOM.scrollIntoViewIfNeeded
     pub async fn scroll_into_view(&self, selector: &str) -> Result<(), Box<dyn std::error::Error>> {
-        let js = format!(
-            r#"(() => {{
-                const el = document.querySelector('{}');
-                if (!el) throw new Error('element not found: {}');
-                el.scrollIntoView({{ behavior: 'instant', block: 'center' }});
-                return true;
-            }})()"#,
-            escape_js_string(selector),
-            escape_js_string(selector)
-        );
-        self.evaluate(&js).await?;
+        let node_id = self.resolve_selector(selector).await?;
+        self.send(
+            "DOM.scrollIntoViewIfNeeded",
+            Some(serde_json::json!({"nodeId": node_id})),
+        )
+        .await?;
         Ok(())
     }
 
     /// Scroll by a delta amount (pixels).
+    /// Mouse position is dynamically set to viewport center for reliable scrolling at any resolution.
     pub async fn scroll_by(
         &self,
         delta_x: f64,
         delta_y: f64,
     ) -> Result<(), Box<dyn std::error::Error>> {
+        // Get actual viewport size from CDP layout metrics
+        let layout = self.send("Page.getLayoutMetrics", None).await?;
+        let vw = layout["cssVisualViewport"]["clientWidth"]
+            .as_f64()
+            .unwrap_or(800.0);
+        let vh = layout["cssVisualViewport"]["clientHeight"]
+            .as_f64()
+            .unwrap_or(600.0);
         self.send(
             "Input.dispatchMouseEvent",
             Some(serde_json::json!({
                 "type": "mouseWheel",
-                "x": 400,
-                "y": 300,
+                "x": vw / 2.0,
+                "y": vh / 2.0,
                 "deltaX": delta_x,
                 "deltaY": delta_y
             })),
@@ -910,18 +1200,17 @@ impl CdpClient {
         selector: &str,
         value: &str,
     ) -> Result<(), Box<dyn std::error::Error>> {
+        let s = js_str(selector);
+        let v = js_str(value);
         let js = format!(
             r#"(() => {{
-                const sel = document.querySelector('{}');
-                if (!sel) throw new Error('select not found: {}');
-                sel.value = '{}';
+                const sel = document.querySelector({s});
+                if (!sel) throw new Error('select not found: ' + {s});
+                sel.value = {v};
                 sel.dispatchEvent(new Event('change', {{ bubbles: true }}));
                 sel.dispatchEvent(new Event('input', {{ bubbles: true }}));
                 return sel.value;
             }})()"#,
-            escape_js_string(selector),
-            escape_js_string(selector),
-            escape_js_string(value)
         );
         self.evaluate(&js).await?;
         Ok(())
@@ -952,10 +1241,7 @@ impl CdpClient {
         text: &str,
         timeout_secs: f64,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        let js = format!(
-            "document.body.innerText.includes('{}')",
-            escape_js_string(text)
-        );
+        let js = format!("document.body.innerText.includes({})", js_str(text));
         let max_attempts = (timeout_secs * 4.0) as u32; // 250ms per attempt
         for _ in 0..max_attempts {
             if let Ok(val) = self.evaluate(&js).await {
@@ -978,7 +1264,7 @@ impl CdpClient {
         pattern: &str,
         timeout_secs: f64,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        let js = format!("location.href.includes('{}')", escape_js_string(pattern));
+        let js = format!("location.href.includes({})", js_str(pattern));
         let max_attempts = (timeout_secs * 4.0) as u32;
         for _ in 0..max_attempts {
             if let Ok(val) = self.evaluate(&js).await {
@@ -1042,25 +1328,17 @@ impl CdpClient {
         .into())
     }
 
-    /// Assert that a CSS selector exists in the DOM.
+    /// Assert that a CSS selector exists in the DOM — pure CDP
     pub async fn assert_selector(&self, selector: &str) -> Result<(), Box<dyn std::error::Error>> {
-        let js = format!(
-            "document.querySelector('{}') !== null",
-            escape_js_string(selector)
-        );
-        let result = self.evaluate(&js).await?;
-        if result != true {
-            return Err(format!("assertion failed: selector '{}' not found", selector).into());
+        match self.resolve_selector(selector).await {
+            Ok(_) => Ok(()),
+            Err(_) => Err(format!("assertion failed: selector '{}' not found", selector).into()),
         }
-        Ok(())
     }
 
     /// Assert that visible text exists on the page.
     pub async fn assert_text(&self, text: &str) -> Result<(), Box<dyn std::error::Error>> {
-        let js = format!(
-            "document.body.innerText.includes('{}')",
-            escape_js_string(text)
-        );
+        let js = format!("document.body.innerText.includes({})", js_str(text));
         let result = self.evaluate(&js).await?;
         if result != true {
             return Err(format!("assertion failed: text '{}' not found on page", text).into());
@@ -1082,22 +1360,157 @@ impl CdpClient {
         Ok(())
     }
 
-    /// Assert that a CSS selector does NOT exist in the DOM.
+    /// Assert that a CSS selector does NOT exist in the DOM — pure CDP
     pub async fn assert_not_selector(
         &self,
         selector: &str,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        let js = format!(
-            "document.querySelector('{}') === null",
-            escape_js_string(selector)
-        );
-        let result = self.evaluate(&js).await?;
-        if result != true {
-            return Err(
-                format!("assertion failed: selector '{}' should not exist", selector).into(),
-            );
+        match self.resolve_selector(selector).await {
+            Ok(_) => {
+                Err(format!("assertion failed: selector '{}' should not exist", selector).into())
+            }
+            Err(_) => Ok(()),
         }
-        Ok(())
+    }
+
+    /// One-shot page exploration — returns everything an Agent needs to forge an adapter.
+    /// Combines screenshot + interactive elements + forms + auth state in a single call.
+    pub async fn explore(
+        &self,
+        screenshot_path: &str,
+    ) -> Result<ExploreResult, Box<dyn std::error::Error>> {
+        // 1. Screenshot
+        self.screenshot(screenshot_path).await?;
+
+        // 2. Page info
+        let page_info = self.get_page_info().await?;
+        let url = page_info["url"].as_str().unwrap_or("").to_string();
+        let title = page_info["title"].as_str().unwrap_or("").to_string();
+
+        // 3. Interactive elements + forms + auth detection in a single evaluate
+        let js = r#"(() => {
+            const elements = [];
+            const forms = [];
+            let loggedIn = false;
+
+            // Detect login state: no visible login button = likely logged in
+            const loginKeywords = ['登录', '登入', 'log in', 'sign in', 'login'];
+            const allText = document.body?.innerText?.toLowerCase() || '';
+            const hasLoginButton = loginKeywords.some(kw => {
+                const els = document.querySelectorAll('button, a, [role=button]');
+                return [...els].some(el => el.textContent.trim().toLowerCase().includes(kw)
+                    && el.offsetParent !== null);
+            });
+            loggedIn = !hasLoginButton;
+
+            // Find interactive elements
+            const interactiveSelectors = 'button, a[href], input, textarea, select, [role=button], [role=link], [role=textbox], [contenteditable=true]';
+            document.querySelectorAll(interactiveSelectors).forEach(el => {
+                const rect = el.getBoundingClientRect();
+                if (rect.width === 0 || rect.height === 0) return;
+                if (el.offsetParent === null && getComputedStyle(el).position !== 'fixed') return;
+
+                const tag = el.tagName.toLowerCase();
+                const role = el.getAttribute('role') || tag;
+                const text = (el.textContent || el.getAttribute('aria-label') || el.getAttribute('placeholder') || '').trim().slice(0, 80);
+
+                let sel = tag;
+                if (el.id) sel = '#' + el.id;
+                else if (el.name) sel = tag + '[name=' + JSON.stringify(el.name) + ']';
+                else if (el.className && typeof el.className === 'string') {
+                    const cls = el.className.trim().split(/\s+/)[0];
+                    if (cls && !cls.match(/[A-Z][a-z]+[A-Z]/)) sel = tag + '.' + CSS.escape(cls);
+                }
+
+                let elementType = 'other';
+                if (tag === 'button' || role === 'button') elementType = 'button';
+                else if (tag === 'a' || role === 'link') elementType = 'link';
+                else if (tag === 'input') {
+                    const t = el.type || 'text';
+                    if (t === 'checkbox') elementType = 'checkbox';
+                    else if (t === 'radio') elementType = 'radio';
+                    else elementType = 'input';
+                }
+                else if (tag === 'textarea' || role === 'textbox') elementType = 'textarea';
+                else if (tag === 'select') elementType = 'select';
+                else if (el.isContentEditable) elementType = 'content_editable';
+
+                elements.push({
+                    tag, role, text, selector: sel,
+                    x: Math.round(rect.x + rect.width/2),
+                    y: Math.round(rect.y + rect.height/2),
+                    width: Math.round(rect.width),
+                    height: Math.round(rect.height),
+                    element_type: elementType,
+                });
+            });
+
+            // Find forms
+            document.querySelectorAll('form').forEach(form => {
+                let formSel = 'form';
+                if (form.id) formSel = '#' + form.id;
+                else if (form.name) formSel = 'form[name=' + JSON.stringify(form.name) + ']';
+
+                const fields = [];
+                form.querySelectorAll('input, textarea, select').forEach(f => {
+                    if (f.type === 'hidden' || f.type === 'submit') return;
+                    let fSel = f.tagName.toLowerCase();
+                    if (f.id) fSel = '#' + f.id;
+                    else if (f.name) fSel = fSel + '[name=' + JSON.stringify(f.name) + ']';
+                    fields.push({
+                        selector: fSel,
+                        field_type: f.type || f.tagName.toLowerCase(),
+                        name: f.name || '',
+                        placeholder: f.placeholder || f.getAttribute('aria-label') || '',
+                    });
+                });
+
+                const submitBtn = form.querySelector('button[type=submit], input[type=submit], button:not([type])');
+                let submitSel = null;
+                if (submitBtn) {
+                    if (submitBtn.id) submitSel = '#' + submitBtn.id;
+                    else submitSel = 'button[type=submit]';
+                }
+
+                forms.push({ selector: formSel, fields, submit_selector: submitSel });
+            });
+
+            return { loggedIn, elements, forms };
+        })()"#;
+
+        let result = self.evaluate(js).await?;
+
+        let logged_in = result["loggedIn"].as_bool().unwrap_or(false);
+
+        let interactive_elements: Vec<InteractiveElement> = result["elements"]
+            .as_array()
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| serde_json::from_value(v.clone()).ok())
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        let forms: Vec<FormInfo> = result["forms"]
+            .as_array()
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| serde_json::from_value(v.clone()).ok())
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        let hints = ExploreHints::from_elements(&interactive_elements);
+
+        Ok(ExploreResult {
+            url,
+            title,
+            screenshot_path: screenshot_path.to_string(),
+            logged_in,
+            interactive_elements,
+            forms,
+            hints: Some(hints),
+        })
     }
 
     /// Close the browser connection.
@@ -1112,6 +1525,17 @@ impl CdpClient {
     pub async fn discover_ws_url(port: u16) -> Result<String, Box<dyn std::error::Error>> {
         let body = Self::http_get(port, "/json").await?;
         let targets: Vec<Value> = serde_json::from_str(&body)?;
+
+        // If no page target exists, create one via /json/new
+        if !targets.iter().any(|t| t["type"].as_str() == Some("page")) {
+            let new_body = Self::http_get(port, "/json/new").await?;
+            let new_target: Value = serde_json::from_str(&new_body)?;
+            let ws_url = new_target["webSocketDebuggerUrl"]
+                .as_str()
+                .ok_or("created new tab but it has no webSocketDebuggerUrl")?;
+            return Ok(ws_url.to_string());
+        }
+
         Self::pick_page_ws_url(&targets)
     }
 
@@ -1335,6 +1759,24 @@ mod tests {
     }
 
     #[test]
+    fn js_str_produces_valid_js_string_literals() {
+        // Simple string
+        assert_eq!(js_str("foo"), r#""foo""#);
+        // Single quotes pass through (no escaping needed in double-quoted JS)
+        assert_eq!(js_str("it's"), r#""it's""#);
+        // Double quotes are escaped
+        assert_eq!(js_str(r#"say "hi""#), r#""say \"hi\"""#);
+        // Backslash is escaped
+        assert_eq!(js_str("back\\slash"), r#""back\\slash""#);
+        // Newline is escaped
+        assert_eq!(js_str("line\nbreak"), r#""line\nbreak""#);
+        // Empty string
+        assert_eq!(js_str(""), r#""""#);
+        // Unicode passes through JSON serialization correctly
+        assert_eq!(js_str("hello"), r#""hello""#);
+    }
+
+    #[test]
     fn key_event_params_structure() {
         let params = key_event_params("keyDown", "a", Some("a"), 0);
         assert_eq!(params["type"], "keyDown");
@@ -1356,5 +1798,164 @@ mod tests {
         let params = key_event_params("keyDown", "a", None, 2);
         assert_eq!(params["modifiers"], 2);
         assert_eq!(params["key"], "a");
+    }
+
+    // ---- explore: one-shot page panorama for adapter forging ----
+    // Classification: quality, what — incomplete explore = more round-trips = slow forging
+    // Why: Agent needs all forging context in a single call to minimize MCP round-trips
+
+    #[test]
+    fn explore_result_contains_all_forging_context() {
+        let result = ExploreResult {
+            url: "https://example.com".to_string(),
+            title: "Example".to_string(),
+            screenshot_path: "/tmp/explore.png".to_string(),
+            logged_in: false,
+            interactive_elements: vec![InteractiveElement {
+                tag: "button".to_string(),
+                role: "button".to_string(),
+                text: "Submit".to_string(),
+                selector: "button.submit".to_string(),
+                x: 100,
+                y: 200,
+                width: 80,
+                height: 30,
+                element_type: ElementType::Button,
+            }],
+            forms: vec![FormInfo {
+                selector: "form#login".to_string(),
+                fields: vec![FormField {
+                    selector: "input#username".to_string(),
+                    field_type: "text".to_string(),
+                    name: "username".to_string(),
+                    placeholder: "Enter username".to_string(),
+                }],
+                submit_selector: Some("button[type=submit]".to_string()),
+            }],
+            hints: None,
+        };
+
+        // Must contain page identity
+        assert!(!result.url.is_empty());
+        assert!(!result.title.is_empty());
+        // Must contain screenshot for visual context
+        assert!(!result.screenshot_path.is_empty());
+        // Must report auth state
+        assert!(!result.logged_in);
+        // Must enumerate interactive elements with stable selectors
+        assert_eq!(result.interactive_elements.len(), 1);
+        assert!(!result.interactive_elements[0].selector.is_empty());
+        // Must detect forms with their fields
+        assert_eq!(result.forms.len(), 1);
+        assert_eq!(result.forms[0].fields.len(), 1);
+    }
+
+    #[test]
+    fn explore_result_serializes_to_json() {
+        // Why: MCP tools return JSON — explore must be serializable
+        let result = ExploreResult {
+            url: "https://test.com".to_string(),
+            title: "Test".to_string(),
+            screenshot_path: "/tmp/test.png".to_string(),
+            logged_in: true,
+            interactive_elements: vec![],
+            forms: vec![],
+            hints: None,
+        };
+        let json = serde_json::to_value(&result).unwrap();
+        assert_eq!(json["url"], "https://test.com");
+        assert_eq!(json["logged_in"], true);
+        assert!(json["interactive_elements"].is_array());
+        assert!(json["forms"].is_array());
+    }
+
+    // ---- explore hints: auto-detect primary input + submit ----
+    // Classification: delight, what — saves Agent one round of analysis
+    // Why: Agent shouldn't scan 22 elements to find the obvious input+submit pair
+
+    #[test]
+    fn explore_result_identifies_primary_input() {
+        // The largest visible textbox/textarea = primary input
+        let result = ExploreResult {
+            url: "https://example.com".to_string(),
+            title: "Test".to_string(),
+            screenshot_path: "/tmp/test.png".to_string(),
+            logged_in: true,
+            interactive_elements: vec![
+                InteractiveElement {
+                    tag: "input".to_string(),
+                    role: "input".to_string(),
+                    text: "Search".to_string(),
+                    selector: "input.search".to_string(),
+                    x: 100,
+                    y: 50,
+                    width: 200,
+                    height: 30,
+                    element_type: ElementType::Input,
+                },
+                InteractiveElement {
+                    tag: "div".to_string(),
+                    role: "textbox".to_string(),
+                    text: "Enter prompt".to_string(),
+                    selector: "div.tiptap".to_string(),
+                    x: 400,
+                    y: 200,
+                    width: 900,
+                    height: 96,
+                    element_type: ElementType::Textarea,
+                },
+            ],
+            forms: vec![],
+            hints: None,
+        };
+        let hints = ExploreHints::from_elements(&result.interactive_elements);
+        // Must pick the largest textbox as primary input
+        assert_eq!(hints.primary_input.as_ref().unwrap().selector, "div.tiptap");
+    }
+
+    #[test]
+    fn explore_result_identifies_submit_button() {
+        // Primary button closest to primary input = submit
+        let elements = vec![
+            InteractiveElement {
+                tag: "div".to_string(),
+                role: "textbox".to_string(),
+                text: "Enter prompt".to_string(),
+                selector: "div.tiptap".to_string(),
+                x: 400,
+                y: 200,
+                width: 900,
+                height: 96,
+                element_type: ElementType::Textarea,
+            },
+            InteractiveElement {
+                tag: "button".to_string(),
+                role: "button".to_string(),
+                text: "".to_string(),
+                selector: "button.submit".to_string(),
+                x: 500,
+                y: 220,
+                width: 36,
+                height: 36,
+                element_type: ElementType::Button,
+            },
+            InteractiveElement {
+                tag: "button".to_string(),
+                role: "button".to_string(),
+                text: "Settings".to_string(),
+                selector: "button.settings".to_string(),
+                x: 50,
+                y: 1200,
+                width: 80,
+                height: 30,
+                element_type: ElementType::Button,
+            },
+        ];
+        let hints = ExploreHints::from_elements(&elements);
+        // Must pick the button closest to the primary input
+        assert_eq!(
+            hints.submit_button.as_ref().unwrap().selector,
+            "button.submit"
+        );
     }
 }
