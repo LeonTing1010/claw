@@ -200,6 +200,59 @@ pub fn load_adapter(
     .into())
 }
 
+#[derive(Debug)]
+pub struct AdapterInfo {
+    pub site: String,
+    pub name: String,
+    pub description: String,
+}
+
+/// Scan adapter directories for .yaml files and return metadata.
+pub fn list_adapters(base_dirs: &[&str]) -> Vec<AdapterInfo> {
+    let mut adapters = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+
+    for base in base_dirs {
+        let base_path = std::path::Path::new(base);
+        let Ok(sites) = std::fs::read_dir(base_path) else { continue };
+
+        for site_entry in sites.flatten() {
+            if !site_entry.path().is_dir() { continue }
+            let site_name = site_entry.file_name().to_string_lossy().to_string();
+
+            let Ok(files) = std::fs::read_dir(site_entry.path()) else { continue };
+            for file_entry in files.flatten() {
+                let path = file_entry.path();
+                if path.extension().and_then(|e| e.to_str()) != Some("yaml") { continue }
+
+                let adapter_name = path.file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("")
+                    .to_string();
+
+                let key = format!("{}/{}", site_name, adapter_name);
+                if seen.contains(&key) { continue }
+                seen.insert(key);
+
+                // Try to parse for description
+                let description = std::fs::read_to_string(&path)
+                    .ok()
+                    .and_then(|content| serde_yml::from_str::<Adapter>(&content).ok())
+                    .and_then(|a| a.description)
+                    .unwrap_or_default();
+
+                adapters.push(AdapterInfo {
+                    site: site_name.clone(),
+                    name: adapter_name,
+                    description,
+                });
+            }
+        }
+    }
+    adapters.sort_by(|a, b| (&a.site, &a.name).cmp(&(&b.site, &b.name)));
+    adapters
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -417,5 +470,19 @@ pipeline:
             "error message should mention 'adapter not found', got: {}",
             err_msg
         );
+    }
+
+    #[test]
+    fn list_adapters_finds_yaml_files() {
+        let adapters = list_adapters(&["adapters"]);
+        assert!(adapters.len() >= 2);
+        assert!(adapters.iter().any(|a| a.site == "bilibili" && a.name == "hot"));
+        assert!(adapters.iter().any(|a| a.site == "xiaohongshu" && a.name == "publish"));
+    }
+
+    #[test]
+    fn list_adapters_empty_dir() {
+        let adapters = list_adapters(&["/nonexistent/path"]);
+        assert!(adapters.is_empty());
     }
 }

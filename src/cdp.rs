@@ -393,7 +393,7 @@ impl CdpClient {
     }
 
     /// Minimal synchronous HTTP GET against Chrome's CDP HTTP endpoints.
-    async fn http_get(port: u16, path: &str) -> Result<String, Box<dyn std::error::Error>> {
+    pub async fn http_get(port: u16, path: &str) -> Result<String, Box<dyn std::error::Error>> {
         let addr = format!("127.0.0.1:{}", port);
         let path = path.to_string();
 

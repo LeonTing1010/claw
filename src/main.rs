@@ -6,7 +6,8 @@ mod template;
 
 use std::collections::HashMap;
 
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory, Parser, Subcommand};
+use clap_complete::{generate, Shell};
 use serde_json::Value;
 
 #[derive(Parser)]
@@ -16,6 +17,10 @@ struct Cli {
     /// Chrome CDP debugging port
     #[arg(long, default_value_t = 9222, global = true)]
     port: u16,
+
+    /// Output format: table, json, csv
+    #[arg(short = 'f', long, default_value = "table", global = true)]
+    format: String,
 
     #[command(subcommand)]
     command: Command,
@@ -35,6 +40,15 @@ enum Command {
     },
     /// Show browser connection info
     Version,
+    /// List available adapters
+    List,
+    /// Diagnose Chrome CDP connection
+    Doctor,
+    /// Generate shell completions
+    Completions {
+        /// Shell: bash, zsh, fish, powershell, elvish
+        shell: Shell,
+    },
     /// Run an adapter (implicit: claw <site> <name> [--args])
     #[command(external_subcommand)]
     Adapter(Vec<String>),
@@ -73,6 +87,84 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             client.navigate(&url).await?;
             println!("navigated to {}", url);
         }
+        Command::List => {
+            let dirs = adapter_base_dirs();
+            let refs: Vec<&str> = dirs.iter().map(|s| s.as_str()).collect();
+            let adapters = adapter::list_adapters(&refs);
+            if adapters.is_empty() {
+                println!("No adapters found.");
+            } else {
+                let columns = vec!["site".into(), "name".into(), "description".into()];
+                let rows: Vec<std::collections::HashMap<String, String>> = adapters.iter().map(|a| {
+                    let mut row = std::collections::HashMap::new();
+                    row.insert("site".into(), a.site.clone());
+                    row.insert("name".into(), a.name.clone());
+                    row.insert("description".into(), a.description.clone());
+                    row
+                }).collect();
+                output::print_output(&columns, &rows, &cli.format)?;
+            }
+        }
+        Command::Completions { shell } => {
+            let mut cmd = Cli::command();
+            generate(shell, &mut cmd, "claw", &mut std::io::stdout());
+        }
+        Command::Doctor => {
+            // 1. TCP connectivity
+            let version_body = match cdp::CdpClient::http_get(cli.port, "/json/version").await {
+                Ok(body) => {
+                    let info: serde_json::Value = serde_json::from_str(&body).unwrap_or_default();
+                    let browser = info["Browser"].as_str().unwrap_or("unknown");
+                    println!("[ok] Chrome reachable on port {} ({})", cli.port, browser);
+                    Some(body)
+                }
+                Err(e) => {
+                    println!("[fail] Cannot connect to Chrome on port {}", cli.port);
+                    println!("       Error: {}", e);
+                    println!("       Start Chrome with: chrome --remote-debugging-port={} --user-data-dir=/tmp/claw-chrome", cli.port);
+                    None
+                }
+            };
+
+            if version_body.is_none() {
+                return Ok(());
+            }
+
+            // 2. Page targets
+            match cdp::CdpClient::http_get(cli.port, "/json").await {
+                Ok(body) => {
+                    let targets: Vec<serde_json::Value> = serde_json::from_str(&body).unwrap_or_default();
+                    let pages = targets.iter().filter(|t| t["type"].as_str() == Some("page")).count();
+                    if pages > 0 {
+                        println!("[ok] {} page target(s) found", pages);
+                    } else {
+                        println!("[warn] No page targets — open a tab in Chrome");
+                        return Ok(());
+                    }
+                }
+                Err(e) => {
+                    println!("[fail] Cannot list targets: {}", e);
+                    return Ok(());
+                }
+            }
+
+            // 3. JS evaluation
+            match cdp::CdpClient::discover_ws_url(cli.port).await {
+                Ok(ws_url) => {
+                    match cdp::CdpClient::connect(&ws_url).await {
+                        Ok(client) => {
+                            match client.evaluate("1+1").await {
+                                Ok(val) if val == 2 => println!("[ok] JavaScript evaluation working"),
+                                Ok(val) => println!("[warn] Unexpected eval result: {}", val),
+                                Err(e) => println!("[fail] JS evaluation failed: {}", e),
+                            }
+                        }
+                        Err(e) => println!("[fail] WebSocket connection failed: {}", e),
+                    }
+                }
+                Err(e) => println!("[fail] Cannot discover page: {}", e),
+            }
+        }
         Command::Adapter(raw_args) => {
             if raw_args.len() < 2 {
                 return Err("usage: claw <site> <name> [--arg value ...]".into());
@@ -80,14 +172,10 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             let site = &raw_args[0];
             let name = &raw_args[1];
 
-            let home = std::env::var("HOME").unwrap_or_default();
-            let base_dirs = vec![
-                "adapters".to_string(),
-                format!("{}/.claw/adapters", home),
-            ];
-            let base_refs: Vec<&str> = base_dirs.iter().map(|s| s.as_str()).collect();
+            let dirs = adapter_base_dirs();
+            let refs: Vec<&str> = dirs.iter().map(|s| s.as_str()).collect();
 
-            let ada = adapter::load_adapter(&base_refs, site, name)?;
+            let ada = adapter::load_adapter(&refs, site, name)?;
 
             // Merge defaults + CLI args
             let mut args = HashMap::new();
@@ -107,10 +195,15 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             let client = cdp::CdpClient::connect(&ws_url).await?;
 
             let rows = pipeline::execute(&ada.pipeline, &client, args).await?;
-            output::print_table(&ada.columns, &rows);
+            output::print_output(&ada.columns, &rows, &cli.format)?;
         }
     }
     Ok(())
+}
+
+fn adapter_base_dirs() -> Vec<String> {
+    let home = std::env::var("HOME").unwrap_or_default();
+    vec!["adapters".to_string(), format!("{}/.claw/adapters", home)]
 }
 
 /// Parse --key value pairs from raw CLI args into a HashMap.
