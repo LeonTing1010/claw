@@ -18,12 +18,18 @@ pub async fn execute(
     for step in steps {
         match step {
             PipelineStep::Navigate(url) => {
-                let ctx = TemplateContext { args: args.clone(), item: None };
+                let ctx = TemplateContext {
+                    args: args.clone(),
+                    item: None,
+                };
                 let rendered = template::render(url, &ctx);
                 client.navigate(&rendered).await?;
             }
             PipelineStep::Evaluate(js) => {
-                let ctx = TemplateContext { args: args.clone(), item: None };
+                let ctx = TemplateContext {
+                    args: args.clone(),
+                    item: None,
+                };
                 let rendered = template::render(js, &ctx);
                 let result = client.evaluate(&rendered).await?;
                 match result {
@@ -38,28 +44,43 @@ pub async fn execute(
                 apply_limit(&mut rows, tmpl, &args);
             }
             PipelineStep::Wait(tmpl) => {
-                let ctx = TemplateContext { args: args.clone(), item: None };
+                let ctx = TemplateContext {
+                    args: args.clone(),
+                    item: None,
+                };
                 let secs: f64 = template::render(tmpl, &ctx).parse().unwrap_or(1.0);
                 tokio::time::sleep(std::time::Duration::from_secs_f64(secs)).await;
             }
             PipelineStep::Click(tmpl) => {
-                let ctx = TemplateContext { args: args.clone(), item: None };
+                let ctx = TemplateContext {
+                    args: args.clone(),
+                    item: None,
+                };
                 let text = template::render(tmpl, &ctx);
                 client.click_text(&text).await?;
             }
             PipelineStep::ClickSelector(tmpl) => {
-                let ctx = TemplateContext { args: args.clone(), item: None };
+                let ctx = TemplateContext {
+                    args: args.clone(),
+                    item: None,
+                };
                 let selector = template::render(tmpl, &ctx);
                 client.click_selector(&selector).await?;
             }
             PipelineStep::Type { selector, text } => {
-                let ctx = TemplateContext { args: args.clone(), item: None };
+                let ctx = TemplateContext {
+                    args: args.clone(),
+                    item: None,
+                };
                 let sel = template::render(selector, &ctx);
                 let txt = template::render(text, &ctx);
                 client.type_into(&sel, &txt).await?;
             }
             PipelineStep::Upload { selector, files } => {
-                let ctx = TemplateContext { args: args.clone(), item: None };
+                let ctx = TemplateContext {
+                    args: args.clone(),
+                    item: None,
+                };
                 let sel = template::render(selector, &ctx);
                 let file_list = template::render(files, &ctx);
                 let paths: Vec<&str> = file_list.split(',').map(|s| s.trim()).collect();
@@ -97,10 +118,11 @@ pub fn apply_limit(
     tmpl: &str,
     args: &HashMap<String, Value>,
 ) {
-    let ctx = TemplateContext { args: args.clone(), item: None };
-    let n: usize = template::render(tmpl, &ctx)
-        .parse()
-        .unwrap_or(rows.len());
+    let ctx = TemplateContext {
+        args: args.clone(),
+        item: None,
+    };
+    let n: usize = template::render(tmpl, &ctx).parse().unwrap_or(rows.len());
     rows.truncate(n);
 }
 

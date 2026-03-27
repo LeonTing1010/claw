@@ -6,9 +6,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::net::TcpStream;
 use tokio::sync::{mpsc, oneshot, Mutex};
-use tokio_tungstenite::{
-    connect_async, tungstenite::Message, MaybeTlsStream, WebSocketStream,
-};
+use tokio_tungstenite::{connect_async, tungstenite::Message, MaybeTlsStream, WebSocketStream};
 
 /// CDP JSON-RPC request
 #[derive(Debug, Serialize)]
@@ -21,6 +19,7 @@ pub struct CdpRequest {
 
 /// CDP JSON-RPC response
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)]
 pub struct CdpResponse {
     pub id: Option<u64>,
     pub result: Option<Value>,
@@ -66,10 +65,10 @@ fn mouse_event_params(event_type: &str, x: f64, y: f64) -> Value {
 /// Escape a string for safe embedding in JavaScript single-quoted strings
 fn escape_js_string(s: &str) -> String {
     s.replace('\\', "\\\\")
-     .replace('\'', "\\'")
-     .replace('"', "\\\"")
-     .replace('\n', "\\n")
-     .replace('\r', "\\r")
+        .replace('\'', "\\'")
+        .replace('"', "\\\"")
+        .replace('\n', "\\n")
+        .replace('\r', "\\r")
 }
 
 /// Build Input.dispatchKeyEvent params
@@ -119,9 +118,7 @@ impl CdpClient {
     }
 
     async fn read_loop(
-        mut read: futures_util::stream::SplitStream<
-            WebSocketStream<MaybeTlsStream<TcpStream>>,
-        >,
+        mut read: futures_util::stream::SplitStream<WebSocketStream<MaybeTlsStream<TcpStream>>>,
         pending: PendingMap,
     ) {
         while let Some(Ok(msg)) = read.next().await {
@@ -187,17 +184,10 @@ impl CdpClient {
 
     /// Navigate to a URL and wait for the page to load.
     pub async fn navigate(&self, url: &str) -> Result<(), Box<dyn std::error::Error>> {
-        self.send(
-            "Page.enable",
-            None,
-        )
-        .await?;
+        self.send("Page.enable", None).await?;
 
-        self.send(
-            "Page.navigate",
-            Some(serde_json::json!({ "url": url })),
-        )
-        .await?;
+        self.send("Page.navigate", Some(serde_json::json!({ "url": url })))
+            .await?;
 
         // Wait for load event
         // TODO: use event listener instead of polling
@@ -232,8 +222,16 @@ impl CdpClient {
 
     /// Click at exact coordinates via CDP native mouse events
     pub async fn click(&self, x: f64, y: f64) -> Result<(), Box<dyn std::error::Error>> {
-        self.send("Input.dispatchMouseEvent", Some(mouse_event_params("mousePressed", x, y))).await?;
-        self.send("Input.dispatchMouseEvent", Some(mouse_event_params("mouseReleased", x, y))).await?;
+        self.send(
+            "Input.dispatchMouseEvent",
+            Some(mouse_event_params("mousePressed", x, y)),
+        )
+        .await?;
+        self.send(
+            "Input.dispatchMouseEvent",
+            Some(mouse_event_params("mouseReleased", x, y)),
+        )
+        .await?;
         Ok(())
     }
 
@@ -247,7 +245,9 @@ impl CdpClient {
                 if (r.width === 0 && r.height === 0) throw new Error('element not visible: {}');
                 return {{ x: r.x + r.width/2, y: r.y + r.height/2 }};
             }})()"#,
-            escape_js_string(selector), escape_js_string(selector), escape_js_string(selector)
+            escape_js_string(selector),
+            escape_js_string(selector),
+            escape_js_string(selector)
         );
         let result = self.evaluate(&js).await?;
         let x = result["x"].as_f64().ok_or("missing x coordinate")?;
@@ -273,7 +273,8 @@ impl CdpClient {
                 }}
                 throw new Error('text not found: {}');
             }})()"#,
-            escape_js_string(text), escape_js_string(text)
+            escape_js_string(text),
+            escape_js_string(text)
         );
         let result = self.evaluate(&js).await?;
         let x = result["x"].as_f64().ok_or("missing x coordinate")?;
@@ -285,47 +286,69 @@ impl CdpClient {
     /// For non-ASCII text (Chinese, emoji), uses Input.insertText instead.
     pub async fn type_text(&self, text: &str) -> Result<(), Box<dyn std::error::Error>> {
         // Check if text contains non-ASCII characters
-        if text.chars().any(|c| !c.is_ascii()) {
+        if !text.is_ascii() {
             // Use insertText for non-ASCII — single CDP call
-            self.send("Input.insertText", Some(serde_json::json!({
-                "text": text
-            }))).await?;
+            self.send(
+                "Input.insertText",
+                Some(serde_json::json!({
+                    "text": text
+                })),
+            )
+            .await?;
             return Ok(());
         }
         // ASCII: dispatch keyDown/keyUp per character
         for ch in text.chars() {
             let key = ch.to_string();
-            self.send("Input.dispatchKeyEvent", Some(
-                key_event_params("keyDown", &key, Some(&key), 0)
-            )).await?;
-            self.send("Input.dispatchKeyEvent", Some(
-                key_event_params("keyUp", &key, None, 0)
-            )).await?;
+            self.send(
+                "Input.dispatchKeyEvent",
+                Some(key_event_params("keyDown", &key, Some(&key), 0)),
+            )
+            .await?;
+            self.send(
+                "Input.dispatchKeyEvent",
+                Some(key_event_params("keyUp", &key, None, 0)),
+            )
+            .await?;
         }
         Ok(())
     }
 
     /// Focus element by selector, clear existing content, then type new text.
-    pub async fn type_into(&self, selector: &str, text: &str) -> Result<(), Box<dyn std::error::Error>> {
+    pub async fn type_into(
+        &self,
+        selector: &str,
+        text: &str,
+    ) -> Result<(), Box<dyn std::error::Error>> {
         // Focus the element
         self.click_selector(selector).await?;
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
         // Select all (Ctrl+A / Cmd+A)
-        self.send("Input.dispatchKeyEvent", Some(
-            key_event_params("keyDown", "a", None, 2)  // modifiers=2 is Ctrl
-        )).await?;
-        self.send("Input.dispatchKeyEvent", Some(
-            key_event_params("keyUp", "a", None, 0)
-        )).await?;
+        self.send(
+            "Input.dispatchKeyEvent",
+            Some(
+                key_event_params("keyDown", "a", None, 2), // modifiers=2 is Ctrl
+            ),
+        )
+        .await?;
+        self.send(
+            "Input.dispatchKeyEvent",
+            Some(key_event_params("keyUp", "a", None, 0)),
+        )
+        .await?;
 
         // Delete selected content
-        self.send("Input.dispatchKeyEvent", Some(
-            key_event_params("keyDown", "Backspace", None, 0)
-        )).await?;
-        self.send("Input.dispatchKeyEvent", Some(
-            key_event_params("keyUp", "Backspace", None, 0)
-        )).await?;
+        self.send(
+            "Input.dispatchKeyEvent",
+            Some(key_event_params("keyDown", "Backspace", None, 0)),
+        )
+        .await?;
+        self.send(
+            "Input.dispatchKeyEvent",
+            Some(key_event_params("keyUp", "Backspace", None, 0)),
+        )
+        .await?;
 
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
@@ -334,36 +357,52 @@ impl CdpClient {
     }
 
     /// Upload files to a file input element via CDP.
-    pub async fn upload_files(&self, selector: &str, paths: &[&str]) -> Result<(), Box<dyn std::error::Error>> {
+    pub async fn upload_files(
+        &self,
+        selector: &str,
+        paths: &[&str],
+    ) -> Result<(), Box<dyn std::error::Error>> {
         // Use Runtime.evaluate to get the RemoteObjectId, then resolve to DOM node
-        let js = format!(
-            "document.querySelector('{}')",
-            escape_js_string(selector)
-        );
-        let result = self.send("Runtime.evaluate", Some(serde_json::json!({
-            "expression": js
-        }))).await?;
+        let js = format!("document.querySelector('{}')", escape_js_string(selector));
+        let result = self
+            .send(
+                "Runtime.evaluate",
+                Some(serde_json::json!({
+                    "expression": js
+                })),
+            )
+            .await?;
 
         let object_id = result["result"]["objectId"]
             .as_str()
             .ok_or(format!("element not found for upload: {}", selector))?;
 
         // Resolve RemoteObject to DOM node
-        let dom_node = self.send("DOM.describeNode", Some(serde_json::json!({
-            "objectId": object_id
-        }))).await?;
+        let dom_node = self
+            .send(
+                "DOM.describeNode",
+                Some(serde_json::json!({
+                    "objectId": object_id
+                })),
+            )
+            .await?;
         let backend_node_id = dom_node["node"]["backendNodeId"]
             .as_i64()
             .ok_or("failed to resolve DOM node for upload")?;
 
-        self.send("DOM.setFileInputFiles", Some(serde_json::json!({
-            "backendNodeId": backend_node_id,
-            "files": paths
-        }))).await?;
+        self.send(
+            "DOM.setFileInputFiles",
+            Some(serde_json::json!({
+                "backendNodeId": backend_node_id,
+                "files": paths
+            })),
+        )
+        .await?;
         Ok(())
     }
 
     /// Close the browser connection.
+    #[allow(dead_code)]
     pub async fn close(&self) -> Result<(), Box<dyn std::error::Error>> {
         self.send("Browser.close", None).await?;
         Ok(())
@@ -408,7 +447,9 @@ impl CdpClient {
                 "GET {} HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n\r\n",
                 path, addr
             );
-            (&stream).write_all(req.as_bytes()).map_err(|e| e.to_string())?;
+            (&stream)
+                .write_all(req.as_bytes())
+                .map_err(|e| e.to_string())?;
 
             let mut reader = BufReader::new(&stream);
             let mut content_length: usize = 0;
@@ -512,7 +553,10 @@ mod tests {
 
         let ws_url = CdpClient::pick_page_ws_url(&targets).unwrap();
         // Must be a page endpoint (not iframe, not browser)
-        assert!(ws_url.contains("/devtools/page/"), "must be a page-level endpoint");
+        assert!(
+            ws_url.contains("/devtools/page/"),
+            "must be a page-level endpoint"
+        );
         assert!(ws_url.contains("PAGE1"), "must pick the first page target");
     }
 

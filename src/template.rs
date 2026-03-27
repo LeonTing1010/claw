@@ -102,10 +102,7 @@ mod tests {
 
     fn make_ctx(args: Vec<(&str, Value)>, item: Option<Value>) -> TemplateContext {
         TemplateContext {
-            args: args
-                .into_iter()
-                .map(|(k, v)| (k.to_string(), v))
-                .collect(),
+            args: args.into_iter().map(|(k, v)| (k.to_string(), v)).collect(),
             item,
         }
     }
@@ -125,18 +122,12 @@ mod tests {
     #[test]
     fn render_passthrough() {
         let ctx = make_ctx(vec![], None);
-        assert_eq!(
-            render("https://bilibili.com", &ctx),
-            "https://bilibili.com"
-        );
+        assert_eq!(render("https://bilibili.com", &ctx), "https://bilibili.com");
     }
 
     #[test]
     fn render_multiple_placeholders() {
-        let ctx = make_ctx(
-            vec![("name", json!("world")), ("count", json!(42))],
-            None,
-        );
+        let ctx = make_ctx(vec![("name", json!("world")), ("count", json!(42))], None);
         assert_eq!(
             render("hello ${{ args.name }}, count=${{ args.count }}", &ctx),
             "hello world, count=42"

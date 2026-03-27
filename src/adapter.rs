@@ -4,6 +4,7 @@ use std::path::Path;
 
 /// Represents a parsed YAML adapter file.
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)]
 pub struct Adapter {
     pub site: String,
     pub name: String,
@@ -19,6 +20,7 @@ pub struct Adapter {
 
 /// Defines an argument with an optional type and default value.
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)]
 pub struct ArgDef {
     #[serde(rename = "type")]
     pub arg_type: Option<String>,
@@ -52,14 +54,11 @@ fn yml_value_to_string(v: &serde_yml::Value) -> Option<String> {
 
 /// Custom deserializer for the pipeline field. Each element is a single-key
 /// map whose key determines the step variant.
-fn deserialize_pipeline<'de, D>(
-    deserializer: D,
-) -> Result<Vec<PipelineStep>, D::Error>
+fn deserialize_pipeline<'de, D>(deserializer: D) -> Result<Vec<PipelineStep>, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
-    let raw: Vec<HashMap<String, serde_yml::Value>> =
-        Vec::deserialize(deserializer)?;
+    let raw: Vec<HashMap<String, serde_yml::Value>> = Vec::deserialize(deserializer)?;
 
     let mut steps = Vec::with_capacity(raw.len());
     for map in raw {
@@ -71,54 +70,35 @@ where
         let (key, value) = map.into_iter().next().unwrap();
         let step = match key.as_str() {
             "navigate" => {
-                let s = yml_value_to_string(&value).ok_or_else(|| {
-                    serde::de::Error::custom(
-                        "navigate value must be a string",
-                    )
-                })?;
+                let s = yml_value_to_string(&value)
+                    .ok_or_else(|| serde::de::Error::custom("navigate value must be a string"))?;
                 PipelineStep::Navigate(s)
             }
             "evaluate" => {
-                let s = yml_value_to_string(&value).ok_or_else(|| {
-                    serde::de::Error::custom(
-                        "evaluate value must be a string",
-                    )
-                })?;
+                let s = yml_value_to_string(&value)
+                    .ok_or_else(|| serde::de::Error::custom("evaluate value must be a string"))?;
                 PipelineStep::Evaluate(s)
             }
             "map" => {
                 let mapping = match value {
                     serde_yml::Value::Mapping(m) => m,
                     _ => {
-                        return Err(serde::de::Error::custom(
-                            "map value must be a mapping",
-                        ));
+                        return Err(serde::de::Error::custom("map value must be a mapping"));
                     }
                 };
                 let mut hm = HashMap::new();
                 for (k, v) in mapping {
-                    let key_str =
-                        yml_value_to_string(&k).ok_or_else(|| {
-                            serde::de::Error::custom(
-                                "map key must be a string",
-                            )
-                        })?;
-                    let val_str =
-                        yml_value_to_string(&v).ok_or_else(|| {
-                            serde::de::Error::custom(
-                                "map value must be a string",
-                            )
-                        })?;
+                    let key_str = yml_value_to_string(&k)
+                        .ok_or_else(|| serde::de::Error::custom("map key must be a string"))?;
+                    let val_str = yml_value_to_string(&v)
+                        .ok_or_else(|| serde::de::Error::custom("map value must be a string"))?;
                     hm.insert(key_str, val_str);
                 }
                 PipelineStep::Map(hm)
             }
             "limit" => {
-                let s = yml_value_to_string(&value).ok_or_else(|| {
-                    serde::de::Error::custom(
-                        "limit value must be a string",
-                    )
-                })?;
+                let s = yml_value_to_string(&value)
+                    .ok_or_else(|| serde::de::Error::custom("limit value must be a string"))?;
                 PipelineStep::Limit(s)
             }
             "wait" => {
@@ -128,9 +108,8 @@ where
                 PipelineStep::Wait(s)
             }
             "click" => {
-                let s = yml_value_to_string(&value).ok_or_else(|| {
-                    serde::de::Error::custom("click value must be a string")
-                })?;
+                let s = yml_value_to_string(&value)
+                    .ok_or_else(|| serde::de::Error::custom("click value must be a string"))?;
                 PipelineStep::Click(s)
             }
             "click_selector" => {
@@ -142,27 +121,45 @@ where
             "type" => {
                 let mapping = match &value {
                     serde_yml::Value::Mapping(m) => m,
-                    _ => return Err(serde::de::Error::custom("type value must be a mapping with selector and text")),
+                    _ => {
+                        return Err(serde::de::Error::custom(
+                            "type value must be a mapping with selector and text",
+                        ))
+                    }
                 };
-                let selector = mapping.get(&serde_yml::Value::String("selector".into()))
-                    .and_then(|v| yml_value_to_string(v))
-                    .ok_or_else(|| serde::de::Error::custom("type step requires 'selector' field"))?;
-                let text = mapping.get(&serde_yml::Value::String("text".into()))
-                    .and_then(|v| yml_value_to_string(v))
+                let selector = mapping
+                    .get(serde_yml::Value::String("selector".into()))
+                    .and_then(yml_value_to_string)
+                    .ok_or_else(|| {
+                        serde::de::Error::custom("type step requires 'selector' field")
+                    })?;
+                let text = mapping
+                    .get(serde_yml::Value::String("text".into()))
+                    .and_then(yml_value_to_string)
                     .ok_or_else(|| serde::de::Error::custom("type step requires 'text' field"))?;
                 PipelineStep::Type { selector, text }
             }
             "upload" => {
                 let mapping = match &value {
                     serde_yml::Value::Mapping(m) => m,
-                    _ => return Err(serde::de::Error::custom("upload value must be a mapping with selector and files")),
+                    _ => {
+                        return Err(serde::de::Error::custom(
+                            "upload value must be a mapping with selector and files",
+                        ))
+                    }
                 };
-                let selector = mapping.get(&serde_yml::Value::String("selector".into()))
-                    .and_then(|v| yml_value_to_string(v))
-                    .ok_or_else(|| serde::de::Error::custom("upload step requires 'selector' field"))?;
-                let files = mapping.get(&serde_yml::Value::String("files".into()))
-                    .and_then(|v| yml_value_to_string(v))
-                    .ok_or_else(|| serde::de::Error::custom("upload step requires 'files' field"))?;
+                let selector = mapping
+                    .get(serde_yml::Value::String("selector".into()))
+                    .and_then(yml_value_to_string)
+                    .ok_or_else(|| {
+                        serde::de::Error::custom("upload step requires 'selector' field")
+                    })?;
+                let files = mapping
+                    .get(serde_yml::Value::String("files".into()))
+                    .and_then(yml_value_to_string)
+                    .ok_or_else(|| {
+                        serde::de::Error::custom("upload step requires 'files' field")
+                    })?;
                 PipelineStep::Upload { selector, files }
             }
             other => {
@@ -185,8 +182,7 @@ pub fn load_adapter(
     name: &str,
 ) -> Result<Adapter, Box<dyn std::error::Error>> {
     for base in base_dirs {
-        let path =
-            Path::new(base).join(site).join(format!("{}.yaml", name));
+        let path = Path::new(base).join(site).join(format!("{}.yaml", name));
         if path.exists() {
             let content = std::fs::read_to_string(&path)?;
             let adapter: Adapter = serde_yml::from_str(&content)?;
@@ -214,24 +210,35 @@ pub fn list_adapters(base_dirs: &[&str]) -> Vec<AdapterInfo> {
 
     for base in base_dirs {
         let base_path = std::path::Path::new(base);
-        let Ok(sites) = std::fs::read_dir(base_path) else { continue };
+        let Ok(sites) = std::fs::read_dir(base_path) else {
+            continue;
+        };
 
         for site_entry in sites.flatten() {
-            if !site_entry.path().is_dir() { continue }
+            if !site_entry.path().is_dir() {
+                continue;
+            }
             let site_name = site_entry.file_name().to_string_lossy().to_string();
 
-            let Ok(files) = std::fs::read_dir(site_entry.path()) else { continue };
+            let Ok(files) = std::fs::read_dir(site_entry.path()) else {
+                continue;
+            };
             for file_entry in files.flatten() {
                 let path = file_entry.path();
-                if path.extension().and_then(|e| e.to_str()) != Some("yaml") { continue }
+                if path.extension().and_then(|e| e.to_str()) != Some("yaml") {
+                    continue;
+                }
 
-                let adapter_name = path.file_stem()
+                let adapter_name = path
+                    .file_stem()
                     .and_then(|s| s.to_str())
                     .unwrap_or("")
                     .to_string();
 
                 let key = format!("{}/{}", site_name, adapter_name);
-                if seen.contains(&key) { continue }
+                if seen.contains(&key) {
+                    continue;
+                }
                 seen.insert(key);
 
                 // Try to parse for description
@@ -294,26 +301,16 @@ pipeline:
 
     #[test]
     fn parse_bilibili_hot_yaml() {
-        let adapter: Adapter =
-            serde_yml::from_str(BILIBILI_HOT_YAML).unwrap();
+        let adapter: Adapter = serde_yml::from_str(BILIBILI_HOT_YAML).unwrap();
 
         assert_eq!(adapter.site, "bilibili");
         assert_eq!(adapter.name, "hot");
-        assert_eq!(
-            adapter.description,
-            Some("B站热门视频".to_string())
-        );
-        assert_eq!(
-            adapter.domain,
-            Some("bilibili.com".to_string())
-        );
+        assert_eq!(adapter.description, Some("B站热门视频".to_string()));
+        assert_eq!(adapter.domain, Some("bilibili.com".to_string()));
         assert_eq!(adapter.strategy, Some("cookie".to_string()));
         assert_eq!(adapter.browser, Some(true));
         assert_eq!(adapter.columns.len(), 4);
-        assert_eq!(
-            adapter.columns,
-            vec!["title", "author", "views", "url"]
-        );
+        assert_eq!(adapter.columns, vec!["title", "author", "views", "url"]);
         assert_eq!(adapter.pipeline.len(), 4);
 
         // First step should be Navigate
@@ -327,8 +324,7 @@ pipeline:
 
     #[test]
     fn parse_args_with_defaults() {
-        let adapter: Adapter =
-            serde_yml::from_str(BILIBILI_HOT_YAML).unwrap();
+        let adapter: Adapter = serde_yml::from_str(BILIBILI_HOT_YAML).unwrap();
 
         let args = adapter.args.as_ref().expect("args should be present");
         let limit = args.get("limit").expect("limit arg should exist");
@@ -339,28 +335,15 @@ pipeline:
 
     #[test]
     fn parse_map_step() {
-        let adapter: Adapter =
-            serde_yml::from_str(BILIBILI_HOT_YAML).unwrap();
+        let adapter: Adapter = serde_yml::from_str(BILIBILI_HOT_YAML).unwrap();
 
         // The map step is the third pipeline step (index 2)
         match &adapter.pipeline[2] {
             PipelineStep::Map(map) => {
-                assert_eq!(
-                    map.get("title"),
-                    Some(&"${{ item.title }}".to_string())
-                );
-                assert_eq!(
-                    map.get("author"),
-                    Some(&"${{ item.author }}".to_string())
-                );
-                assert_eq!(
-                    map.get("views"),
-                    Some(&"${{ item.views }}".to_string())
-                );
-                assert_eq!(
-                    map.get("url"),
-                    Some(&"${{ item.url }}".to_string())
-                );
+                assert_eq!(map.get("title"), Some(&"${{ item.title }}".to_string()));
+                assert_eq!(map.get("author"), Some(&"${{ item.author }}".to_string()));
+                assert_eq!(map.get("views"), Some(&"${{ item.views }}".to_string()));
+                assert_eq!(map.get("url"), Some(&"${{ item.url }}".to_string()));
             }
             _ => panic!("expected Map as third pipeline step"),
         }
@@ -476,8 +459,12 @@ pipeline:
     fn list_adapters_finds_yaml_files() {
         let adapters = list_adapters(&["adapters"]);
         assert!(adapters.len() >= 2);
-        assert!(adapters.iter().any(|a| a.site == "bilibili" && a.name == "hot"));
-        assert!(adapters.iter().any(|a| a.site == "xiaohongshu" && a.name == "publish"));
+        assert!(adapters
+            .iter()
+            .any(|a| a.site == "bilibili" && a.name == "hot"));
+        assert!(adapters
+            .iter()
+            .any(|a| a.site == "xiaohongshu" && a.name == "publish"));
     }
 
     #[test]

@@ -110,10 +110,8 @@ mod tests {
     fn find_chrome_returns_path_on_macos() {
         // This test only passes on macOS with Chrome installed
         if cfg!(target_os = "macos")
-            && std::path::Path::new(
-                "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
-            )
-            .exists()
+            && std::path::Path::new("/Applications/Google Chrome.app/Contents/MacOS/Google Chrome")
+                .exists()
         {
             let path = find_chrome().unwrap();
             assert!(path.exists());

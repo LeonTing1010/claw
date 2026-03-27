@@ -65,12 +65,15 @@ pub fn print_output(
         "table" => println!("{}", format_table(columns, rows)),
         "json" => println!("{}", format_json(columns, rows)),
         "csv" => println!("{}", format_csv(columns, rows)),
-        other => return Err(format!("unknown format: {} (expected: table, json, csv)", other).into()),
+        other => {
+            return Err(format!("unknown format: {} (expected: table, json, csv)", other).into())
+        }
     }
     Ok(())
 }
 
 /// Format and print to stdout (table format).
+#[allow(dead_code)]
 pub fn print_table(columns: &[String], rows: &[HashMap<String, String>]) {
     println!("{}", format_table(columns, rows));
 }

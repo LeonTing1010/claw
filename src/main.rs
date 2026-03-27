@@ -12,7 +12,10 @@ use clap_complete::{generate, Shell};
 use serde_json::Value;
 
 #[derive(Parser)]
-#[command(name = "claw", about = "Turn any website into a CLI — with native browser precision")]
+#[command(
+    name = "claw",
+    about = "Turn any website into a CLI — with native browser precision"
+)]
 #[command(allow_external_subcommands = true)]
 struct Cli {
     /// Chrome CDP debugging port
@@ -99,13 +102,16 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 println!("No adapters found.");
             } else {
                 let columns = vec!["site".into(), "name".into(), "description".into()];
-                let rows: Vec<std::collections::HashMap<String, String>> = adapters.iter().map(|a| {
-                    let mut row = std::collections::HashMap::new();
-                    row.insert("site".into(), a.site.clone());
-                    row.insert("name".into(), a.name.clone());
-                    row.insert("description".into(), a.description.clone());
-                    row
-                }).collect();
+                let rows: Vec<std::collections::HashMap<String, String>> = adapters
+                    .iter()
+                    .map(|a| {
+                        let mut row = std::collections::HashMap::new();
+                        row.insert("site".into(), a.site.clone());
+                        row.insert("name".into(), a.name.clone());
+                        row.insert("description".into(), a.description.clone());
+                        row
+                    })
+                    .collect();
                 output::print_output(&columns, &rows, &cli.format)?;
             }
         }
@@ -137,8 +143,12 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             // 2. Page targets
             match cdp::CdpClient::http_get(cli.port, "/json").await {
                 Ok(body) => {
-                    let targets: Vec<serde_json::Value> = serde_json::from_str(&body).unwrap_or_default();
-                    let pages = targets.iter().filter(|t| t["type"].as_str() == Some("page")).count();
+                    let targets: Vec<serde_json::Value> =
+                        serde_json::from_str(&body).unwrap_or_default();
+                    let pages = targets
+                        .iter()
+                        .filter(|t| t["type"].as_str() == Some("page"))
+                        .count();
                     if pages > 0 {
                         println!("[ok] {} page target(s) found", pages);
                     } else {
@@ -154,18 +164,14 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
 
             // 3. JS evaluation
             match cdp::CdpClient::discover_ws_url(cli.port).await {
-                Ok(ws_url) => {
-                    match cdp::CdpClient::connect(&ws_url).await {
-                        Ok(client) => {
-                            match client.evaluate("1+1").await {
-                                Ok(val) if val == 2 => println!("[ok] JavaScript evaluation working"),
-                                Ok(val) => println!("[warn] Unexpected eval result: {}", val),
-                                Err(e) => println!("[fail] JS evaluation failed: {}", e),
-                            }
-                        }
-                        Err(e) => println!("[fail] WebSocket connection failed: {}", e),
-                    }
-                }
+                Ok(ws_url) => match cdp::CdpClient::connect(&ws_url).await {
+                    Ok(client) => match client.evaluate("1+1").await {
+                        Ok(val) if val == 2 => println!("[ok] JavaScript evaluation working"),
+                        Ok(val) => println!("[warn] Unexpected eval result: {}", val),
+                        Err(e) => println!("[fail] JS evaluation failed: {}", e),
+                    },
+                    Err(e) => println!("[fail] WebSocket connection failed: {}", e),
+                },
                 Err(e) => println!("[fail] Cannot discover page: {}", e),
             }
         }
@@ -246,10 +252,7 @@ mod tests {
 
     #[test]
     fn parse_adapter_args_numeric() {
-        let raw: Vec<String> = vec!["--limit", "5"]
-            .into_iter()
-            .map(String::from)
-            .collect();
+        let raw: Vec<String> = vec!["--limit", "5"].into_iter().map(String::from).collect();
         let args = parse_adapter_args(&raw);
         assert_eq!(args.get("limit"), Some(&json!(5)));
     }
@@ -266,10 +269,7 @@ mod tests {
 
     #[test]
     fn parse_adapter_args_flag() {
-        let raw: Vec<String> = vec!["--verbose"]
-            .into_iter()
-            .map(String::from)
-            .collect();
+        let raw: Vec<String> = vec!["--verbose"].into_iter().map(String::from).collect();
         let args = parse_adapter_args(&raw);
         assert_eq!(args.get("verbose"), Some(&json!(true)));
     }
