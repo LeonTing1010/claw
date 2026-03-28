@@ -1,0 +1,44 @@
+site: dictionary
+name: search
+description: 英语词典查词（Free Dictionary API）
+domain: dictionaryapi.dev
+strategy: public
+browser: true
+version: "1"
+last_forged: "2026-03-28"
+forged_by: "claude-opus-4"
+
+args:
+  word:
+    type: string
+
+columns: [word, partOfSpeech, definition, example]
+
+pipeline:
+  - navigate: https://dictionaryapi.dev
+  - evaluate: |
+      (async () => {
+        const word = '${{ args.word }}';
+        const res = await fetch('https://api.dictionaryapi.dev/api/v2/entries/en/' + encodeURIComponent(word));
+        if (!res.ok) return [{ word: word, partOfSpeech: '-', definition: 'Not found', example: '-' }];
+        const data = await res.json();
+        const results = [];
+        for (const entry of data) {
+          for (const m of entry.meanings) {
+            for (const d of m.definitions.slice(0, 2)) {
+              results.push({
+                word: entry.word,
+                partOfSpeech: m.partOfSpeech,
+                definition: d.definition,
+                example: d.example || '-'
+              });
+            }
+          }
+        }
+        return results;
+      })()
+  - map:
+      word: ${{ item.word }}
+      partOfSpeech: ${{ item.partOfSpeech }}
+      definition: ${{ item.definition }}
+      example: ${{ item.example }}

@@ -1,0 +1,36 @@
+site: pixiv
+name: ranking
+description: Pixiv 每日插画排行榜
+domain: pixiv.net
+strategy: public
+browser: true
+version: "1"
+last_forged: "2026-03-28"
+forged_by: "claude-opus-4"
+
+args:
+  limit:
+    type: int
+    default: 20
+
+columns: [rank, title, author, views]
+
+pipeline:
+  - navigate: https://www.pixiv.net/ranking.php?mode=daily
+  - evaluate: |
+      (async () => {
+        const res = await fetch('https://www.pixiv.net/ranking.php?mode=daily&content=all&p=1&format=json');
+        const data = await res.json();
+        return (data.contents || []).map(w => ({
+          rank: w.rank,
+          title: w.title,
+          author: w.user_name,
+          views: w.view_count
+        }));
+      })()
+  - map:
+      rank: ${{ item.rank }}
+      title: ${{ item.title }}
+      author: ${{ item.author }}
+      views: ${{ item.views }}
+  - limit: ${{ args.limit }}
