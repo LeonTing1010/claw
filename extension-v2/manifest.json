@@ -51,6 +51,9 @@
       "matches": ["<all_urls>"]
     }
   ],
+  "sandbox": {
+    "pages": ["sandbox.html"]
+  },
   "externally_connectable": {
     "matches": ["<all_urls>"]
   },

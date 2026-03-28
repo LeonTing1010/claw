@@ -537,6 +537,11 @@ fn tools_schema() -> Value {
                 "required": ["site", "name", "code"]
             }
         },
+        {
+            "name": "sync_claws",
+            "description": "Sync claws from GitHub registry. Downloads new/updated .claw.js files to the extension. Returns count of synced and unchanged claws.",
+            "inputSchema": { "type": "object", "properties": {} }
+        },
         // ===== INTERCEPT — Active Request Interception =====
         {
             "name": "intercept_on",
@@ -750,6 +755,10 @@ async fn execute_tool(
             let path = format!("{}/{}.claw.js", dir, claw_name);
             std::fs::write(&path, code)?;
             Ok(json!(format!("saved to {}", path)))
+        }
+
+        "sync_claws" => {
+            client.send("Claw.sync", Some(json!({}))).await
         }
 
         // --- CDP relay tools — forward directly to extension ---
