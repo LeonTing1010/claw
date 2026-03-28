@@ -4,48 +4,49 @@ description: 即梦AI 文生图 — 提交 prompt 触发生成
 domain: jimeng.jianying.com
 strategy: cookie
 browser: true
-version: "5"
+version: "6"
 last_forged: "2026-03-27"
 forged_by: "claude-opus-4"
 
 args:
   prompt:
     type: string
-    default: ""
 
 columns: [status, prompt]
 
-pipeline:
-  - navigate: https://jimeng.jianying.com/ai-tool/home
-  - wait_for:
-      selector: ".tiptap"
-      timeout: 20
-  - wait: 1
+run: |
+  page:goto("https://jimeng.jianying.com/ai-tool/home")
+  page:wait_for_selector(".tiptap", 20)
+  page:wait(1)
 
-  # 切换到图片生成模式
-  - click: "图片生成"
-  - wait: 0.5
-  - click: "图片生成"
-  - wait: 1
+  -- 切换到图片生成模式
+  page:click_text("图片生成")
+  page:wait(0.5)
+  page:click_text("图片生成")
+  page:wait(1)
 
-  # 语义寻址：输入 prompt 到主输入框
-  - type:
-      target: primary_input
-      text: "${{ args.prompt }}"
-  - wait: 0.5
+  -- 找到主输入框 (最大的textbox)
+  local inputs = page:find("", "textbox")
+  local target = ".tiptap"
+  if inputs then
+    local max_area = 0
+    for _, el in ipairs(inputs) do
+      local area = (el.width or 0) * (el.height or 0)
+      if area > max_area then
+        max_area = area
+        target = el.selector
+      end
+    end
+  end
 
-  # 语义寻址：点击提交按钮
-  - click:
-      target: submit_button
-  - wait: 3
+  page:type_into(target, args.prompt)
+  page:wait(0.5)
 
-  # 返回状态
-  - evaluate: |
-      (() => {
-        const editor = document.querySelector('.tiptap[role=textbox]');
-        const prompt = editor ? editor.textContent.trim() : '';
-        return [{ status: 'submitted', prompt: prompt.substring(0, 80) || 'sent' }];
-      })()
-  - map:
-      status: ${{ item.status }}
-      prompt: ${{ item.prompt }}
+  -- 找最近的按钮点击
+  local buttons = page:find("", "button")
+  if buttons and #buttons > 0 then
+    page:click_selector(buttons[#buttons].selector)
+  end
+  page:wait(3)
+
+  return { status = "submitted", prompt = args.prompt:sub(1, 80) }

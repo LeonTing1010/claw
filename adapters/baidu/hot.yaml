@@ -1,0 +1,33 @@
+site: baidu
+name: hot
+description: 百度热搜榜
+domain: baidu.com
+strategy: public
+browser: true
+
+args:
+  limit:
+    type: int
+    default: 20
+
+columns: [rank, title, hot]
+
+pipeline:
+  - navigate: https://www.baidu.com
+  - wait: 2
+  - evaluate: |
+      (async () => {
+        const res = await fetch('https://top.baidu.com/api/board?platform=wise&tab=realtime');
+        const data = await res.json();
+        const items = (data.data && data.data.cards && data.data.cards[0] && data.data.cards[0].content) || [];
+        return items.map((item, i) => ({
+          rank: i + 1,
+          title: item.word || item.query || '',
+          hot: item.hotScore || 0
+        }));
+      })()
+  - map:
+      rank: ${{ item.rank }}
+      title: ${{ item.title }}
+      hot: ${{ item.hot }}
+  - limit: ${{ args.limit }}

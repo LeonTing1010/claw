@@ -1,0 +1,53 @@
+site: x
+name: trending
+description: X/Twitter 热门话题
+domain: x.com
+strategy: cookie
+browser: true
+
+args:
+  limit:
+    type: int
+    default: 20
+
+columns: [rank, title, hot]
+
+pipeline:
+  - navigate: https://x.com/explore/tabs/trending
+  - wait: 4
+  - evaluate: |
+      (() => {
+        const items = [];
+        // X/Twitter trending items are in the explore/trending tab
+        const trends = document.querySelectorAll('[data-testid="trend"], [data-testid="cellInnerDiv"]');
+        trends.forEach((el, i) => {
+          const spans = el.querySelectorAll('span');
+          let title = '';
+          let hot = '';
+          spans.forEach(s => {
+            const text = (s.textContent || '').trim();
+            // Trending topic names are typically prefixed with # or are plain text
+            if (text.startsWith('#') || (text.length > 1 && text.length < 100 && !text.includes('Trending') && !text.includes('posts'))) {
+              if (!title && text.length > 1) title = text;
+            }
+            if (text.includes('posts') || text.includes('K') || text.includes('M')) {
+              if (!hot) hot = text;
+            }
+          });
+          if (title) {
+            items.push({ rank: i + 1, title: title, hot: hot || '0' });
+          }
+        });
+        // Deduplicate by title
+        const seen = new Set();
+        return items.filter(x => {
+          if (seen.has(x.title)) return false;
+          seen.add(x.title);
+          return true;
+        });
+      })()
+  - map:
+      rank: ${{ item.rank }}
+      title: ${{ item.title }}
+      hot: ${{ item.hot }}
+  - limit: ${{ args.limit }}

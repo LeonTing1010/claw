@@ -1,0 +1,77 @@
+site: telegraph
+name: publish
+description: Telegraph 匿名发布文章（无需登录）
+domain: telegra.ph
+strategy: public
+browser: true
+version: "1"
+last_forged: "2026-03-27"
+forged_by: "claude-opus-4"
+
+args:
+  title:
+    type: string
+    default: "Untitled"
+  author:
+    type: string
+    default: ""
+  content:
+    type: string
+    default: ""
+
+columns: [status, url]
+
+run: |
+  page:goto("https://telegra.ph")
+  page:wait(2)
+
+  -- Telegraph uses Quill editor, starts disabled. Activate via Quill API.
+  page:evaluate("quill.enable(true)")
+  page:wait(0.5)
+
+  -- Write title via Quill API (direct DOM changes are ignored by Quill)
+  page:evaluate(string.format(
+    "quill.setText('\\n'); quill.insertText(0, %q, {header: 1})",
+    args.title
+  ))
+
+  -- Write author if provided
+  if args.author and args.author ~= "" then
+    page:evaluate(string.format([[
+      (() => {
+        const addr = document.querySelector('.ql-editor address');
+        const a = addr.querySelector('a') || document.createElement('a');
+        a.textContent = %q;
+        if (!addr.contains(a)) addr.appendChild(a);
+        addr.classList.remove('empty');
+      })()
+    ]], args.author))
+  end
+
+  -- Write body content via Quill API
+  if args.content and args.content ~= "" then
+    page:evaluate(string.format(
+      "quill.insertText(quill.getLength() - 1, %q)",
+      args.content
+    ))
+  end
+
+  page:wait(0.5)
+
+  -- Publish button is hidden by CSS. Force visible, then click.
+  page:evaluate([[
+    document.querySelector('#_publish_button').style.cssText =
+      'visibility: visible !important; display: inline-block !important;'
+  ]])
+  page:wait(0.3)
+  page:click_selector("#_publish_button")
+  page:wait(3)
+
+  -- Check result: URL changes on success
+  local info = page:page_info()
+  local url = info.url or ""
+  local published = url ~= "https://telegra.ph/" and url:find("telegra.ph/") ~= nil
+  return {
+    status = published and "published" or "failed",
+    url = url
+  }

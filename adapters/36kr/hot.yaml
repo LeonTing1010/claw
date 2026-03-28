@@ -1,0 +1,45 @@
+site: 36kr
+name: hot
+description: 36氪热榜 — 科技创投资讯
+domain: 36kr.com
+strategy: public
+browser: true
+
+args:
+  limit:
+    type: int
+    default: 20
+
+columns: [rank, title, hot]
+
+pipeline:
+  - navigate: https://www.36kr.com
+  - wait: 2
+  - evaluate: |
+      (async () => {
+        const res = await fetch('https://gateway.36kr.com/api/mis/nav/home/nav/rank/hot');
+        const data = await res.json();
+        if (data.code === 0 && data.data && data.data.hotRankList) {
+          return data.data.hotRankList.map((item, i) => ({
+            rank: i + 1,
+            title: item.templateMaterial && item.templateMaterial.widgetTitle || item.title || '',
+            hot: item.hotScore || item.statRead || 0
+          }));
+        }
+        // Fallback: newsflash API
+        const res2 = await fetch('https://36kr.com/api/newsflash?b_id=0&per_page=20');
+        const data2 = await res2.json();
+        if (data2.code === 0 && data2.data && data2.data.items) {
+          return data2.data.items.map((item, i) => ({
+            rank: i + 1,
+            title: item.title || '',
+            hot: '0'
+          }));
+        }
+        return [];
+      })()
+  - map:
+      rank: ${{ item.rank }}
+      title: ${{ item.title }}
+      hot: ${{ item.hot }}
+  - limit: ${{ args.limit }}

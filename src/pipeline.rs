@@ -7,16 +7,18 @@ use crate::cdp::CdpClient;
 use crate::template::{self, TemplateContext};
 
 /// Execute the adapter pipeline and return rows (each row is column → value).
+/// `depth` tracks recursive adapter calls (for `use:` steps) to prevent infinite loops.
 pub async fn execute(
     steps: &[PipelineStep],
     client: &CdpClient,
     args: HashMap<String, Value>,
+    depth: u8,
 ) -> Result<Vec<HashMap<String, String>>, Box<dyn std::error::Error>> {
     let mut data: Vec<Value> = Vec::new();
     let mut rows: Vec<HashMap<String, String>> = Vec::new();
 
     for (i, step) in steps.iter().enumerate() {
-        execute_single_step(step, client, &args, &mut data, &mut rows)
+        execute_single_step(step, client, &args, &mut data, &mut rows, depth)
             .await
             .map_err(|e| format!("step {}: {} — {}", i, step_label(step), e))?;
     }
@@ -54,16 +56,7 @@ pub fn step_label(step: &PipelineStep) -> String {
         PipelineStep::Wait(t) => format!("wait: {}", t),
         PipelineStep::Click(t) => format!("click: \"{}\"", truncate(t, 40)),
         PipelineStep::ClickSelector(s) => format!("click_selector: {}", truncate(s, 40)),
-        PipelineStep::ClickTarget(t) => format!("click_target: {}", truncate(t, 40)),
-        PipelineStep::Type {
-            selector, target, ..
-        } => {
-            let label = selector
-                .as_deref()
-                .or(target.as_deref())
-                .unwrap_or("<unknown>");
-            format!("type: {}", truncate(label, 40))
-        }
+        PipelineStep::Type { selector, .. } => format!("type: {}", truncate(selector, 40)),
         PipelineStep::Upload { selector, .. } => format!("upload: {}", truncate(selector, 40)),
         PipelineStep::WaitFor { selector, .. } => format!("wait_for: {}", truncate(selector, 40)),
         PipelineStep::WaitForText { text, .. } => {
@@ -101,9 +94,11 @@ pub fn step_label(step: &PipelineStep) -> String {
         }
         PipelineStep::SelectPath(path) => format!("select: {}", truncate(path, 40)),
         PipelineStep::Filter(expr) => format!("filter: {}", truncate(expr, 40)),
+        PipelineStep::Transform(_) => "transform: <lua>".to_string(),
         PipelineStep::Intercept { capture, .. } => {
             format!("intercept: {}", truncate(capture, 40))
         }
+        PipelineStep::Use { adapter, .. } => format!("use: {}", truncate(adapter, 40)),
     }
 }
 
@@ -113,21 +108,6 @@ fn truncate(s: &str, max: usize) -> &str {
     } else {
         &s[..max]
     }
-}
-
-/// Resolve a semantic target name (e.g. "primary_input", "submit_button") to a CSS selector.
-/// Explores the current page to get hints, then delegates to adapter::resolve_target.
-async fn resolve_target(
-    target: &str,
-    client: &CdpClient,
-) -> Result<String, Box<dyn std::error::Error>> {
-    let screenshot_path = "/tmp/claw_resolve_target.png";
-    let explore = client.explore(screenshot_path).await?;
-    let hints = explore
-        .hints
-        .as_ref()
-        .ok_or_else(|| format!("could not resolve target '{}' — no hints available", target))?;
-    crate::adapter::resolve_target(target, hints)
 }
 
 /// Resolve a dot-notation path against a JSON value.
@@ -281,6 +261,7 @@ pub async fn execute_with_report(
     steps: &[PipelineStep],
     client: &CdpClient,
     args: HashMap<String, Value>,
+    depth: u8,
 ) -> Vec<StepResult> {
     let mut results = Vec::new();
     let mut data: Vec<Value> = Vec::new();
@@ -290,7 +271,7 @@ pub async fn execute_with_report(
         let label = step_label(step);
         let start = std::time::Instant::now();
 
-        let outcome = execute_single_step(step, client, &args, &mut data, &mut rows).await;
+        let outcome = execute_single_step(step, client, &args, &mut data, &mut rows, depth).await;
         let duration_ms = start.elapsed().as_millis();
 
         let (status, error, suggestion, page_url, screenshot_path) = match outcome {
@@ -332,12 +313,14 @@ pub async fn execute_with_report(
 }
 
 /// Execute a single pipeline step, mutating data/rows state.
+/// `depth` tracks recursive adapter calls for the `use:` step.
 pub async fn execute_single_step(
     step: &PipelineStep,
     client: &CdpClient,
     args: &HashMap<String, Value>,
     data: &mut Vec<Value>,
     rows: &mut Vec<HashMap<String, String>>,
+    depth: u8,
 ) -> Result<(), Box<dyn std::error::Error>> {
     match step {
         PipelineStep::Navigate(url) => {
@@ -390,35 +373,13 @@ pub async fn execute_single_step(
             let selector = template::render(tmpl, &ctx);
             client.click_selector(&selector).await?;
         }
-        PipelineStep::ClickTarget(target) => {
-            // Resolve semantic target via hints (primary_input, submit_button)
+        PipelineStep::Type { selector, text } => {
             let ctx = TemplateContext {
                 args: args.clone(),
                 item: None,
             };
-            let target_name = template::render(target, &ctx);
-            let selector = resolve_target(&target_name, client).await?;
-            client.click_selector(&selector).await?;
-        }
-        PipelineStep::Type {
-            selector,
-            target,
-            text,
-        } => {
-            let ctx = TemplateContext {
-                args: args.clone(),
-                item: None,
-            };
+            let sel = template::render(selector, &ctx);
             let txt = template::render(text, &ctx);
-            // Resolve selector from explicit selector or semantic target
-            let sel = if let Some(s) = selector {
-                template::render(s, &ctx)
-            } else if let Some(t) = target {
-                let target_name = template::render(t, &ctx);
-                resolve_target(&target_name, client).await?
-            } else {
-                return Err("type step requires 'selector' or 'target'".into());
-            };
             client.type_into(&sel, &txt).await?;
         }
         PipelineStep::Upload { selector, files } => {
@@ -601,11 +562,12 @@ pub async fn execute_single_step(
                 "document.querySelector('{}') !== null",
                 crate::cdp::escape_js_string(&sel)
             );
-            if let Ok(val) = client.evaluate(&js).await {
-                if val == true {
-                    for sub in then_steps {
-                        Box::pin(execute_single_step(sub, client, args, data, rows)).await?;
-                    }
+            // Resolve the condition before any sub-step awaits to avoid
+            // holding Box<dyn Error> across await points (Send requirement).
+            let condition = client.evaluate(&js).await.ok() == Some(serde_json::Value::Bool(true));
+            if condition {
+                for sub in then_steps {
+                    Box::pin(execute_single_step(sub, client, args, data, rows, depth)).await?;
                 }
             }
         }
@@ -619,11 +581,10 @@ pub async fn execute_single_step(
                 "document.body.innerText.includes('{}')",
                 crate::cdp::escape_js_string(&txt)
             );
-            if let Ok(val) = client.evaluate(&js).await {
-                if val == true {
-                    for sub in then_steps {
-                        Box::pin(execute_single_step(sub, client, args, data, rows)).await?;
-                    }
+            let condition = client.evaluate(&js).await.ok() == Some(serde_json::Value::Bool(true));
+            if condition {
+                for sub in then_steps {
+                    Box::pin(execute_single_step(sub, client, args, data, rows, depth)).await?;
                 }
             }
         }
@@ -640,11 +601,10 @@ pub async fn execute_single_step(
                 "location.href.includes('{}')",
                 crate::cdp::escape_js_string(&pat)
             );
-            if let Ok(val) = client.evaluate(&js).await {
-                if val == true {
-                    for sub in then_steps {
-                        Box::pin(execute_single_step(sub, client, args, data, rows)).await?;
-                    }
+            let condition = client.evaluate(&js).await.ok() == Some(serde_json::Value::Bool(true));
+            if condition {
+                for sub in then_steps {
+                    Box::pin(execute_single_step(sub, client, args, data, rows, depth)).await?;
                 }
             }
         }
@@ -744,6 +704,22 @@ pub async fn execute_single_step(
                 data.retain(|item| evaluate_filter_expr(&rendered_expr, item));
             }
         }
+        PipelineStep::Transform(script) => {
+            let ctx = TemplateContext {
+                args: args.clone(),
+                item: None,
+            };
+            let rendered = template::render(script, &ctx);
+            let data_clone = data.clone();
+            let args_clone = args.clone();
+            let result = tokio::task::spawn_blocking(move || {
+                crate::lua_adapter::execute_transform(&rendered, &data_clone, &args_clone)
+            })
+            .await
+            .map_err(|e| -> Box<dyn std::error::Error> { Box::new(e) })?
+            .map_err(|e| -> Box<dyn std::error::Error> { e })?;
+            *data = result;
+        }
         PipelineStep::Intercept {
             trigger,
             capture,
@@ -815,6 +791,50 @@ pub async fn execute_single_step(
                 Value::Array(arr) => *data = arr,
                 other => *data = vec![other],
             }
+        }
+        PipelineStep::Use {
+            adapter,
+            args: step_args,
+        } => {
+            let ctx = TemplateContext {
+                args: args.clone(),
+                item: None,
+            };
+            let rendered_adapter = template::render(adapter, &ctx);
+            let (site, name) = rendered_adapter.split_once('/').ok_or_else(|| {
+                format!(
+                    "use: adapter must be 'site/name', got: {}",
+                    rendered_adapter
+                )
+            })?;
+
+            let mut use_args: HashMap<String, Value> = HashMap::new();
+            if let Some(sa) = step_args {
+                for (k, v) in sa {
+                    let rendered = template::render(v, &ctx);
+                    let json_val = if let Ok(n) = rendered.parse::<i64>() {
+                        Value::Number(n.into())
+                    } else if let Ok(f) = rendered.parse::<f64>() {
+                        Value::Number(
+                            serde_json::Number::from_f64(f)
+                                .unwrap_or_else(|| serde_json::Number::from(0)),
+                        )
+                    } else {
+                        Value::String(rendered)
+                    };
+                    use_args.insert(k.clone(), json_val);
+                }
+            }
+
+            let (_, result_rows) =
+                crate::adapter::run_adapter(client, site, name, use_args, depth + 1)
+                    .await
+                    .map_err(|e| -> Box<dyn std::error::Error> { e })?;
+            // Inject result rows as data for subsequent map/filter/limit steps
+            *data = result_rows
+                .iter()
+                .map(|r| serde_json::to_value(r).unwrap_or(Value::Null))
+                .collect();
         }
     }
     Ok(())
@@ -962,6 +982,156 @@ mod tests {
             PipelineStep::Filter(expr) => assert_eq!(expr, "item.views > 100"),
             _ => panic!("expected Filter"),
         }
+    }
+
+    #[test]
+    fn parse_transform_step() {
+        let step =
+            crate::adapter::parse_single_step("transform: return sort_by(data, 'views', 'desc')")
+                .unwrap();
+        match step {
+            PipelineStep::Transform(s) => assert!(s.contains("sort_by")),
+            _ => panic!("expected Transform"),
+        }
+    }
+
+    #[test]
+    fn transform_sort_by_desc() {
+        let data = vec![
+            json!({"title": "A", "views": 100}),
+            json!({"title": "B", "views": 500}),
+            json!({"title": "C", "views": 200}),
+        ];
+        let args = HashMap::new();
+        let result = crate::lua_adapter::execute_transform(
+            "return sort_by(data, 'views', 'desc')",
+            &data,
+            &args,
+        )
+        .unwrap();
+        assert_eq!(result.len(), 3);
+        assert_eq!(result[0]["title"], "B");
+        assert_eq!(result[1]["title"], "C");
+        assert_eq!(result[2]["title"], "A");
+    }
+
+    #[test]
+    fn transform_limit() {
+        let data: Vec<Value> = (0..10).map(|i| json!({"n": i})).collect();
+        let args = HashMap::new();
+        let result =
+            crate::lua_adapter::execute_transform("return limit(data, 3)", &data, &args).unwrap();
+        assert_eq!(result.len(), 3);
+    }
+
+    #[test]
+    fn transform_pick_fields() {
+        let data = vec![json!({"title": "A", "views": 100, "extra": "x"})];
+        let args = HashMap::new();
+        let result = crate::lua_adapter::execute_transform(
+            "return pick(data, 'title', 'views')",
+            &data,
+            &args,
+        )
+        .unwrap();
+        assert_eq!(result[0]["title"], "A");
+        assert_eq!(result[0]["views"], 100);
+        assert!(result[0].get("extra").is_none());
+    }
+
+    #[test]
+    fn transform_filter_with_lua() {
+        let data = vec![
+            json!({"title": "A", "views": 100}),
+            json!({"title": "B", "views": 5000}),
+            json!({"title": "C", "views": 200}),
+        ];
+        let args = HashMap::new();
+        let result = crate::lua_adapter::execute_transform(
+            r#"
+            local result = {}
+            for _, item in ipairs(data) do
+                if item.views > 300 then
+                    result[#result + 1] = item
+                end
+            end
+            return result
+            "#,
+            &data,
+            &args,
+        )
+        .unwrap();
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0]["title"], "B");
+    }
+
+    #[test]
+    fn transform_uses_args() {
+        let data = vec![
+            json!({"title": "A", "views": 100}),
+            json!({"title": "B", "views": 500}),
+        ];
+        let mut args = HashMap::new();
+        args.insert("min".to_string(), json!(200));
+        let result = crate::lua_adapter::execute_transform(
+            r#"
+            local result = {}
+            for _, item in ipairs(data) do
+                if item.views >= args.min then
+                    result[#result + 1] = item
+                end
+            end
+            return result
+            "#,
+            &data,
+            &args,
+        )
+        .unwrap();
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0]["title"], "B");
+    }
+
+    #[test]
+    fn transform_group_by() {
+        let data = vec![
+            json!({"platform": "weibo", "title": "X"}),
+            json!({"platform": "bilibili", "title": "Y"}),
+            json!({"platform": "weibo", "title": "Z"}),
+        ];
+        let args = HashMap::new();
+        let result = crate::lua_adapter::execute_transform(
+            "return group_by(data, 'platform')",
+            &data,
+            &args,
+        )
+        .unwrap();
+        assert_eq!(result.len(), 2);
+        // First group: weibo (appeared first)
+        assert_eq!(result[0]["key"], "weibo");
+        assert_eq!(result[0]["count"], 2);
+        assert_eq!(result[1]["key"], "bilibili");
+        assert_eq!(result[1]["count"], 1);
+    }
+
+    #[test]
+    fn transform_unique_by() {
+        let data = vec![
+            json!({"platform": "weibo", "title": "A"}),
+            json!({"platform": "bilibili", "title": "B"}),
+            json!({"platform": "weibo", "title": "C"}),
+            json!({"platform": "bilibili", "title": "D"}),
+        ];
+        let args = HashMap::new();
+        let result = crate::lua_adapter::execute_transform(
+            "return unique_by(data, 'platform')",
+            &data,
+            &args,
+        )
+        .unwrap();
+        // Keeps first occurrence of each platform
+        assert_eq!(result.len(), 2);
+        assert_eq!(result[0]["title"], "A"); // first weibo
+        assert_eq!(result[1]["title"], "B"); // first bilibili
     }
 
     // ---- login URL resolution ----

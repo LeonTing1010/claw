@@ -5,6 +5,7 @@ mod lua_adapter;
 mod mcp;
 mod output;
 mod pipeline;
+mod sync;
 mod template;
 
 use std::collections::HashMap;
@@ -16,7 +17,7 @@ use serde_json::Value;
 #[derive(Parser)]
 #[command(
     name = "claw",
-    about = "Turn any website into a CLI — with native browser precision"
+    about = "The web capability cache for AI agents — forge once, execute forever"
 )]
 #[command(allow_external_subcommands = true)]
 struct Cli {
@@ -50,8 +51,10 @@ enum Command {
     },
     /// Show browser connection info
     Version,
-    /// List available adapters
+    /// List available claws (website API specs)
     List,
+    /// Download/update claws from GitHub
+    Sync,
     /// Diagnose Chrome CDP connection
     Doctor,
     /// Generate shell completions
@@ -229,40 +232,40 @@ enum Command {
         #[arg(long, value_delimiter = ',')]
         args: Vec<String>,
     },
-    /// Dry-run an adapter and report per-step health
+    /// Verify a claw — dry-run and report per-step health
     #[command(name = "verify-adapter")]
     VerifyAdapter {
         /// Site name
         site: String,
-        /// Adapter name
+        /// Claw name
         name: String,
         /// Arguments as --key value pairs (passed through)
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         adapter_args: Vec<String>,
     },
 
-    /// Save an adapter YAML to ~/.claw/adapters/ (backs up previous version)
+    /// Save a claw YAML to ~/.claw/adapters/ (backs up previous version)
     #[command(name = "save-adapter")]
     SaveAdapter {
-        /// Path to the adapter YAML file to save
+        /// Path to the claw YAML file to save
         file: String,
     },
-    /// Rollback an adapter to the previous version
+    /// Rollback a claw to the previous version
     #[command(name = "rollback-adapter")]
     RollbackAdapter {
         /// Site name
         site: String,
-        /// Adapter name
+        /// Claw name
         name: String,
     },
 
     /// Open a site in the browser for manual login (cookie persists in ~/.claw/chrome-profile/)
     Login {
-        /// Site domain or adapter site name (e.g. jimeng, xiaohongshu, bilibili)
+        /// Site domain or site name (e.g. jimeng, xiaohongshu, bilibili)
         site: String,
     },
 
-    /// Run an adapter (implicit: claw <site> <name> [--args])
+    /// Run a claw (implicit: claw <site> <name> [--args])
     #[command(external_subcommand)]
     Adapter(Vec<String>),
 }
@@ -313,25 +316,53 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             client.navigate(&url).await?;
             println!("navigated to {}", url);
         }
+        Command::Sync => {
+            sync::sync_claws().await?;
+        }
         Command::List => {
-            let dirs = adapter_base_dirs();
+            if sync::needs_sync() {
+                eprintln!("First run — syncing claws from GitHub...");
+                if let Err(e) = sync::sync_claws().await {
+                    eprintln!("Warning: sync failed ({}). Continuing with local claws.", e);
+                }
+            }
+            let dirs = adapter::adapter_base_dirs();
             let refs: Vec<&str> = dirs.iter().map(|s| s.as_str()).collect();
             let adapters = adapter::list_adapters(&refs);
             if adapters.is_empty() {
-                println!("No adapters found.");
+                println!("No claws found. Run `claw sync` or add YAML files to ~/.claw/adapters/");
             } else {
                 let columns = vec!["site".into(), "name".into(), "description".into()];
+                let mut need_login: Vec<String> = Vec::new();
                 let rows: Vec<std::collections::HashMap<String, String>> = adapters
                     .iter()
                     .map(|a| {
                         let mut row = std::collections::HashMap::new();
-                        row.insert("site".into(), a.site.clone());
+                        let site_display = if a.strategy == "public" {
+                            a.site.clone()
+                        } else {
+                            if !need_login.contains(&a.site) {
+                                need_login.push(a.site.clone());
+                            }
+                            format!("{} *", a.site)
+                        };
+                        row.insert("site".into(), site_display);
                         row.insert("name".into(), a.name.clone());
                         row.insert("description".into(), a.description.clone());
                         row
                     })
                     .collect();
                 output::print_output(&columns, &rows, &cli.format)?;
+                if !need_login.is_empty() {
+                    eprintln!(
+                        "\n* Need login first: {}",
+                        need_login
+                            .iter()
+                            .map(|s| format!("claw login {}", s))
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    );
+                }
             }
         }
         Command::Completions { shell } => {
@@ -597,7 +628,8 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             let mut data = Vec::new();
             let mut rows = Vec::new();
             let result =
-                pipeline::execute_single_step(&parsed, &client, &args, &mut data, &mut rows).await;
+                pipeline::execute_single_step(&parsed, &client, &args, &mut data, &mut rows, 0)
+                    .await;
             let duration_ms = start.elapsed().as_millis();
 
             let (status, error, suggestion) = match result {
@@ -625,7 +657,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             name,
             adapter_args,
         } => {
-            let dirs = adapter_base_dirs();
+            let dirs = adapter::adapter_base_dirs();
             let refs: Vec<&str> = dirs.iter().map(|s| s.as_str()).collect();
             let ada = adapter::load_adapter(&refs, &site, &name)?;
 
@@ -647,7 +679,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             let ws_url = cdp::CdpClient::discover_ws_url(cli.port).await?;
             let client = cdp::CdpClient::connect(&ws_url).await?;
 
-            let results = pipeline::execute_with_report(&ada.pipeline, &client, args).await;
+            let results = pipeline::execute_with_report(&ada.pipeline, &client, args, 0).await;
 
             let pass_count = results.iter().filter(|r| r.status == "pass").count();
             let total = results.len();
@@ -708,7 +740,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             let ws_url = cdp::CdpClient::discover_ws_url(cli.port).await?;
             let client = cdp::CdpClient::connect(&ws_url).await?;
 
-            let dirs = adapter_base_dirs();
+            let dirs = adapter::adapter_base_dirs();
             let refs: Vec<&str> = dirs.iter().map(|s| s.as_str()).collect();
             let url = adapter::resolve_login_url(&refs, &site);
 
@@ -725,14 +757,37 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             if raw_args.len() < 2 {
                 return Err("usage: claw <site> <name> [--arg value ...]".into());
             }
+
+            if sync::needs_sync() {
+                eprintln!("First run — syncing claws from GitHub...");
+                if let Err(e) = sync::sync_claws().await {
+                    eprintln!("Warning: sync failed ({}). Continuing with local claws.", e);
+                }
+            }
+
+            // Extract -f/--format from raw args (clap doesn't parse external subcommand flags)
+            let mut format = cli.format.clone();
+            let mut filtered_args: Vec<String> = Vec::new();
+            let mut i = 0;
+            while i < raw_args.len() {
+                if (raw_args[i] == "-f" || raw_args[i] == "--format") && i + 1 < raw_args.len() {
+                    format = raw_args[i + 1].clone();
+                    i += 2;
+                } else {
+                    filtered_args.push(raw_args[i].clone());
+                    i += 1;
+                }
+            }
+            let raw_args = filtered_args;
+
             let site = &raw_args[0];
             let name = &raw_args[1];
 
-            let dirs = adapter_base_dirs();
+            let dirs = adapter::adapter_base_dirs();
             let refs: Vec<&str> = dirs.iter().map(|s| s.as_str()).collect();
 
             // Try Lua adapter first, then YAML
-            let lua_path = find_lua_adapter(&refs, site, name);
+            let lua_path = adapter::find_lua_adapter(&refs, site, name);
 
             if let Some(lua_path) = lua_path {
                 // Lua adapter
@@ -743,8 +798,8 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 let client = cdp::CdpClient::connect(&ws_url).await?;
 
                 let (columns, rows) =
-                    lua_adapter::execute_lua_adapter(&lua_path, client, cli_args).await?;
-                output::print_output(&columns, &rows, &cli.format)?;
+                    lua_adapter::execute_lua_adapter(&lua_path, client, cli_args, 0).await?;
+                output::print_output(&columns, &rows, &format)?;
             } else {
                 // YAML adapter
                 let ada = adapter::load_adapter(&refs, site, name)?;
@@ -766,30 +821,20 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 let ws_url = cdp::CdpClient::discover_ws_url(cli.port).await?;
                 let client = cdp::CdpClient::connect(&ws_url).await?;
 
-                let rows = pipeline::execute(&ada.pipeline, &client, args).await?;
-                output::print_output(&ada.columns, &rows, &cli.format)?;
+                // run: Lua or pipeline: YAML
+                if let Some(ref script) = ada.run {
+                    let rows =
+                        lua_adapter::execute_inline_lua(script, &ada.columns, client, args, 0)
+                            .await?;
+                    output::print_output(&ada.columns, &rows, &format)?;
+                } else {
+                    let rows = pipeline::execute(&ada.pipeline, &client, args, 0).await?;
+                    output::print_output(&ada.columns, &rows, &format)?;
+                }
             }
         }
     }
     Ok(())
-}
-
-fn adapter_base_dirs() -> Vec<String> {
-    let home = std::env::var("HOME").unwrap_or_default();
-    vec!["adapters".to_string(), format!("{}/.claw/adapters", home)]
-}
-
-/// Search for a Lua adapter file in base directories.
-fn find_lua_adapter(base_dirs: &[&str], site: &str, name: &str) -> Option<String> {
-    for base in base_dirs {
-        let path = std::path::Path::new(base)
-            .join(site)
-            .join(format!("{}.lua", name));
-        if path.exists() {
-            return Some(path.to_string_lossy().to_string());
-        }
-    }
-    None
 }
 
 /// Parse --key value pairs from raw CLI args into a HashMap.

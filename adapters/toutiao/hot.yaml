@@ -1,0 +1,32 @@
+site: toutiao
+name: hot
+description: 头条热榜
+domain: toutiao.com
+strategy: public
+browser: true
+
+args:
+  limit:
+    type: int
+    default: 20
+
+columns: [rank, title, hot]
+
+pipeline:
+  - navigate: https://www.toutiao.com
+  - wait: 3
+  - evaluate: |
+      (async () => {
+        const res = await fetch('https://www.toutiao.com/hot-event/hot-board/?origin=toutiao_pc');
+        const data = await res.json();
+        return (data.data || []).map((item, i) => ({
+          rank: i + 1,
+          title: item.Title || '',
+          hot: item.HotValue || 0
+        }));
+      })()
+  - map:
+      rank: ${{ item.rank }}
+      title: ${{ item.title }}
+      hot: ${{ item.hot }}
+  - limit: ${{ args.limit }}

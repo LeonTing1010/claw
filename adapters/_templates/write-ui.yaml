@@ -1,15 +1,14 @@
 # Template: UI Write Operation (Tier 5)
 #
-# Use when: must interact with the UI directly — publish, submit, upload.
-# Uses CDP native events for framework compatibility (React/Vue/Angular).
+# Use when: must interact with the UI — publish, submit, upload.
+# YAML metadata + intent for WHAT, Lua run: for HOW.
 #
 # How to forge:
-#   1. navigate to the target page
-#   2. ax-tree / read-dom to understand page structure
-#   3. find elements by text/selector
-#   4. Build step-by-step with try-step, verify each action
-#   5. Add assert steps to verify success
-#   6. Add if_selector for modal/popup handling
+#   1. RECON: network_log_start → navigate → explore → trigger → network_log_dump_bodies
+#   2. If no API found, use this template
+#   3. Fill in the run: script with page:* calls
+#   4. Define intent success conditions
+#   5. verify_adapter to check both pipeline and intent
 
 site: SITE_NAME
 name: COMMAND_NAME
@@ -34,51 +33,33 @@ args:
 
 columns: [status, detail]
 
-pipeline:
-  # 1. Navigate to the publish page
-  - navigate: https://example.com/publish
-  - wait_for:
-      selector: ".editor"
-      timeout: 10
+run: |
+  page:goto("https://example.com/publish")
+  page:wait_for_selector(".editor", 10)
 
-  # 2. Handle potential modal/popup
-  - if_selector:
-      selector: ".modal-overlay"
-      then:
-        - click_selector: ".modal-close"
-        - wait: 1
+  -- Handle potential modal
+  if page:find(".modal-overlay") then
+    page:click_selector(".modal-close")
+    page:wait(1)
+  end
 
-  # 3. Upload images (if provided)
-  # - upload:
-  #     selector: "input[type='file']"
-  #     files: "${{ args.images }}"
-  # - wait_for_network_idle: 15
+  -- Upload images (if provided)
+  if args.images and args.images ~= "" then
+    page:upload("input[type='file']", args.images)
+    page:wait(15)
+  end
 
-  # 4. Fill form fields
-  - type:
-      selector: ".title-input"
-      text: "${{ args.title }}"
-  - wait: 0.5
+  -- Fill form fields
+  page:type_into(".title-input", args.title)
+  page:wait(0.5)
+  page:type_into(".content-editor", args.content)
+  page:wait(0.5)
 
-  - type:
-      selector: ".content-editor"
-      text: "${{ args.content }}"
-  - wait: 0.5
+  -- Submit
+  page:click_text("发布")
+  page:wait_for_url("/success", 10)
 
-  # 5. Submit
-  - click: "发布"
-
-  # 6. Verify success
-  - wait_for_url:
-      pattern: "/success"
-      timeout: 10
-  - assert_not_selector: ".error-banner"
-
-  # 7. Return result
-  - evaluate: |
-      (() => {
-        return [{ status: 'published', detail: location.href }];
-      })()
-  - map:
-      status: ${{ item.status }}
-      detail: ${{ item.detail }}
+  return {
+    status = "published",
+    detail = page:page_info().url
+  }

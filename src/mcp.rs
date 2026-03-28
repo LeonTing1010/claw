@@ -369,7 +369,7 @@ fn tools_schema() -> Value {
         },
         {
             "name": "verify_adapter",
-            "description": "Dry-run an adapter and report per-step health (pass/fail, timing).",
+            "description": "Verify a claw — dry-run and report per-step health (pass/fail, timing, diagnostics).",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -382,7 +382,7 @@ fn tools_schema() -> Value {
         },
         {
             "name": "try_step",
-            "description": "Execute a single pipeline step and return structured result (status, timing, error).",
+            "description": "Try a single pipeline step and return structured result (status, timing, error). Use during forging to test steps incrementally.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -403,7 +403,25 @@ fn tools_schema() -> Value {
                 },
                 "required": ["url", "output"]
             }
-        }
+        },
+        {
+            "name": "list_adapters",
+            "description": "List all available claws. Returns site, name, and description for each. Use this to discover what websites Claw can access.",
+            "inputSchema": { "type": "object", "properties": {} }
+        },
+        {
+            "name": "run_adapter",
+            "description": "Run a claw and return structured data (JSON rows). This is the primary way to get data from websites. Example: run_adapter({site: 'weibo', name: 'hot'}) returns trending topics.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "site": { "type": "string", "description": "Site name (e.g. 'weibo', 'bilibili')" },
+                    "name": { "type": "string", "description": "Adapter name (e.g. 'hot', 'trending')" },
+                    "args": { "type": "object", "description": "Adapter arguments (e.g. {limit: 10})", "additionalProperties": true }
+                },
+                "required": ["site", "name"]
+            }
+        },
     ])
 }
 
@@ -591,7 +609,7 @@ async fn execute_tool(
             }
 
             let results =
-                crate::pipeline::execute_with_report(&ada.pipeline, client, adapter_args).await;
+                crate::pipeline::execute_with_report(&ada.pipeline, client, adapter_args, 0).await;
             Ok(json!(results))
         }
         "try_step" => {
@@ -610,7 +628,7 @@ async fn execute_tool(
             let mut data = Vec::new();
             let mut rows = Vec::new();
             let result = crate::pipeline::execute_single_step(
-                &parsed, client, &step_args, &mut data, &mut rows,
+                &parsed, client, &step_args, &mut data, &mut rows, 0,
             )
             .await;
             let duration_ms = start.elapsed().as_millis();
@@ -642,6 +660,81 @@ async fn execute_tool(
             std::fs::write(output, &bytes)?;
             Ok(json!(format!("{} ({} bytes)", output, bytes.len())))
         }
+        "list_adapters" => {
+            let base_dirs = crate::adapter::adapter_base_dirs();
+            let refs: Vec<&str> = base_dirs.iter().map(|s| s.as_str()).collect();
+            let adapters = crate::adapter::list_adapters(&refs);
+            let list: Vec<Value> = adapters
+                .iter()
+                .map(|a| {
+                    json!({
+                        "site": a.site,
+                        "name": a.name,
+                        "description": a.description,
+                        "strategy": a.strategy
+                    })
+                })
+                .collect();
+            Ok(json!(list))
+        }
+        "run_adapter" => {
+            let site = args["site"].as_str().ok_or("missing site")?;
+            let name = args["name"].as_str().ok_or("missing name")?;
+            let mut adapter_args = HashMap::new();
+            if let Some(obj) = args["args"].as_object() {
+                for (k, v) in obj {
+                    adapter_args.insert(k.clone(), v.clone());
+                }
+            }
+            let (columns, rows) = crate::adapter::run_adapter(client, site, name, adapter_args, 0)
+                .await
+                .map_err(|e| -> Box<dyn std::error::Error> { e })?;
+            let json_rows: Vec<Value> = rows
+                .iter()
+                .map(|row| {
+                    let obj: serde_json::Map<String, Value> = row
+                        .iter()
+                        .map(|(k, v)| (k.clone(), Value::String(v.clone())))
+                        .collect();
+                    Value::Object(obj)
+                })
+                .collect();
+            Ok(json!({
+                "columns": columns,
+                "rows": json_rows,
+                "count": json_rows.len()
+            }))
+        }
         _ => Err(format!("unknown tool: {}", name).into()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tools_schema_includes_list_adapters() {
+        let schema = tools_schema();
+        let tools = schema.as_array().unwrap();
+        assert!(
+            tools.iter().any(|t| t["name"] == "list_adapters"),
+            "MCP tools must include list_adapters"
+        );
+    }
+
+    #[test]
+    fn tools_schema_includes_run_adapter() {
+        let schema = tools_schema();
+        let tools = schema.as_array().unwrap();
+        assert!(
+            tools.iter().any(|t| t["name"] == "run_adapter"),
+            "MCP tools must include run_adapter"
+        );
+        // run_adapter must require site and name
+        let tool = tools.iter().find(|t| t["name"] == "run_adapter").unwrap();
+        let required = tool["inputSchema"]["required"].as_array().unwrap();
+        assert!(required.contains(&json!("site")));
+        assert!(required.contains(&json!("name")));
     }
 }

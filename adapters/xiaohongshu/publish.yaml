@@ -4,7 +4,7 @@ description: 小红书发布图文笔记
 domain: creator.xiaohongshu.com
 strategy: cookie
 browser: true
-version: "2"
+version: "3"
 last_forged: "2026-03-27"
 forged_by: "claude-opus-4"
 
@@ -17,50 +17,38 @@ args:
     default: ""
   images:
     type: string
-    default: ""
 
 columns: [status, detail]
 
-pipeline:
-  # 1. 打开发布页
-  - navigate: https://creator.xiaohongshu.com/publish/publish
-  - wait_for:
-      selector: ".creator-tab"
-      timeout: 10
+run: |
+  page:goto("https://creator.xiaohongshu.com/publish/publish")
+  page:wait_for_selector(".creator-tab", 10)
 
-  # 2. 切换到"上传图文" tab（CDP native click）
-  - click: "上传图文"
-  - wait: 2
+  page:click_text("上传图文")
+  page:wait(2)
 
-  # 3. 上传图片（CDP native DOM.setFileInputFiles）
-  - upload:
-      selector: "input.upload-input"
-      files: "${{ args.images }}"
-  - wait_for_network_idle: 20
+  -- 上传图片 (required by args layer)
+  page:upload("input.upload-input", args.images)
+  page:wait(20)
 
-  # 4. 填写标题（CDP native keyboard）
-  - type:
-      selector: "input.d-text"
-      text: "${{ args.title }}"
-  - wait: 0.5
+  -- 填写标题 (optional)
+  if args.title ~= "" then
+    page:type_into("input.d-text", args.title)
+    page:wait(0.5)
+  end
 
-  # 5. 填写正文（CDP native keyboard into ProseMirror editor）
-  - type:
-      selector: ".tiptap.ProseMirror"
-      text: "${{ args.content }}"
-  - wait: 0.5
+  -- 填写正文 (optional)
+  if args.content ~= "" then
+    page:type_into(".tiptap.ProseMirror", args.content)
+    page:wait(0.5)
+  end
 
-  # 6. 点击发布按钮（CDP native click）
-  - click: "发布"
-  - wait: 5
+  -- 发布 — run: 只执行动作，不判断成败
+  page:click_text("发布")
+  page:wait(5)
 
-  # 7. 检查结果
-  - evaluate: |
-      (() => {
-        const url = location.href;
-        const success = !url.includes('/publish/publish');
-        return [{ status: success ? 'published' : 'check-browser', detail: url }];
-      })()
-  - map:
-      status: ${{ item.status }}
-      detail: ${{ item.detail }}
+  -- 返回事实，不做判断 — intent.success 会验证
+  return {
+    status = "submitted",
+    detail = page:page_info().url or ""
+  }

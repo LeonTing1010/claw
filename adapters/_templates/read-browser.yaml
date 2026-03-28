@@ -4,8 +4,8 @@
 # Navigate to set cookie context, then fetch with credentials.
 #
 # How to forge:
-#   1. navigate to the site (must be logged in via Chrome)
-#   2. network-log start → interact → network-log dump
+#   1. site_model_get — check if API is already known
+#   2. RECON: network_log_start → navigate → interact → network_log_dump_bodies
 #   3. Find the authenticated API endpoint
 #   4. Use evaluate + fetch(url, {credentials:'include'})
 

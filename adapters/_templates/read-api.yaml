@@ -4,10 +4,9 @@
 # Fastest path — no browser, no cookies, pure HTTP.
 #
 # How to forge:
-#   1. navigate to the site
-#   2. network-log start → interact → network-log dump
-#   3. Find the API endpoint that returns the data
-#   4. Replace the URL and field mappings below
+#   1. RECON: network_log_start → navigate → interact → network_log_dump_bodies
+#   2. Find the API endpoint in the network log
+#   3. Replace URL and field mappings below
 
 site: SITE_NAME
 name: COMMAND_NAME

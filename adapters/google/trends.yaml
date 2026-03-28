@@ -1,0 +1,54 @@
+site: google
+name: trends
+description: Google Trends 热门搜索
+domain: trends.google.com
+strategy: public
+browser: true
+
+args:
+  limit:
+    type: int
+    default: 20
+  geo:
+    type: string
+    default: "US"
+
+columns: [rank, title, hot]
+
+pipeline:
+  - navigate: https://trends.google.com/trending?geo=${{ args.geo }}
+  - wait: 4
+  - evaluate: |
+      (() => {
+        // Google Trends trending page renders items in a structured feed
+        const items = [];
+        // Try the trending search table rows
+        const rows = document.querySelectorAll('[jsname] .mZ3RIc, tr[jsaction], .feed-item, [data-hveid]');
+        if (rows.length > 0) {
+          rows.forEach((row, i) => {
+            const titleEl = row.querySelector('.mZ3RIc, .title, a') || row;
+            const title = (titleEl.textContent || '').trim().split('\n')[0].trim();
+            const hotEl = row.querySelector('.lqv0Cb, .search-count-title, [aria-label*="search"]');
+            const hot = hotEl ? hotEl.textContent.replace(/[^0-9KMB+.]/g, '') : '';
+            if (title && title.length > 1 && title.length < 200) {
+              items.push({ rank: i + 1, title: title, hot: hot || '0' });
+            }
+          });
+        }
+        // Fallback: extract from any visible trending list
+        if (items.length === 0) {
+          const allLinks = document.querySelectorAll('a[href*="/trending"]');
+          allLinks.forEach((a, i) => {
+            const text = (a.textContent || '').trim();
+            if (text && text.length > 1 && text.length < 200) {
+              items.push({ rank: i + 1, title: text, hot: '0' });
+            }
+          });
+        }
+        return items;
+      })()
+  - map:
+      rank: ${{ item.rank }}
+      title: ${{ item.title }}
+      hot: ${{ item.hot }}
+  - limit: ${{ args.limit }}

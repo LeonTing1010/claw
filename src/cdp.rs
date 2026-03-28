@@ -63,6 +63,7 @@ pub struct NetworkEntry {
 }
 
 type NetworkLog = Arc<Mutex<Vec<NetworkEntry>>>;
+
 /// Pending requests (requestWillBeSent but not yet responseReceived)
 type PendingRequests = Arc<Mutex<HashMap<String, (String, String, Option<Value>)>>>; // requestId → (url, method, headers)
 
@@ -590,7 +591,9 @@ impl CdpClient {
                     Some(serde_json::json!({"nodeId": node_id})),
                 )
                 .await;
-            if let Ok((x, y)) = self.get_box_center(node_id).await {
+            // Use .ok() to drop Box<dyn Error> before await (Send requirement)
+            let center = self.get_box_center(node_id).await.ok();
+            if let Some((x, y)) = center {
                 return self.click(x, y).await;
             }
         }

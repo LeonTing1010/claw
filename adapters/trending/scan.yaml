@@ -1,0 +1,116 @@
+site: trending
+name: scan
+description: 跨平台热搜聚合 + 新词检测
+strategy: public
+browser: true
+version: "3"
+last_forged: "2026-03-28"
+forged_by: "claude-opus-4"
+
+args:
+  limit:
+    type: int
+    default: 20
+  platforms:
+    type: string
+    default: "weibo,zhihu,baidu,douyin,toutiao,bilibili,36kr,hackernews,google,youtube,x,xiaohongshu,producthunt"
+
+columns: [status, platform, rank, title, hot]
+
+run: |
+  local limit = args.limit or 20
+  local all_rows = {}
+
+  -- Parse wanted platforms
+  local wanted = {}
+  local wanted_order = {}
+  local platforms_str = args.platforms or "weibo,zhihu,baidu,douyin,toutiao,bilibili,36kr,hackernews,google,youtube,x,xiaohongshu,producthunt"
+  for p in platforms_str:gmatch("[^,]+") do
+    local name = p:match("^%s*(.-)%s*$")
+    wanted[name] = true
+    wanted_order[#wanted_order + 1] = name
+  end
+
+  -- All platforms use claw.run() — single loop, zero inline JS
+  local platforms = {
+    { name="weibo",       site="weibo",       adapter="hot" },
+    { name="zhihu",       site="zhihu",       adapter="hot" },
+    { name="baidu",       site="baidu",       adapter="hot" },
+    { name="douyin",      site="douyin",      adapter="hot" },
+    { name="toutiao",     site="toutiao",     adapter="hot" },
+    { name="bilibili",    site="bilibili",    adapter="hot" },
+    { name="36kr",        site="36kr",        adapter="hot" },
+    { name="hackernews",  site="hackernews",  adapter="hot" },
+    { name="google",      site="google",      adapter="trends" },
+    { name="youtube",     site="youtube",     adapter="trending" },
+    { name="x",           site="x",           adapter="trending" },
+    { name="xiaohongshu", site="xiaohongshu", adapter="hot" },
+    { name="producthunt", site="producthunt", adapter="hot" },
+  }
+
+  for _, p in ipairs(platforms) do
+    if wanted[p.name] then
+      local ok, data = pcall(claw.run, p.site, p.adapter, { limit = limit })
+      if ok and type(data) == "table" then
+        for i, item in ipairs(data) do
+          if i > limit then break end
+          all_rows[#all_rows + 1] = {
+            platform = p.name,
+            rank     = tostring(item.rank or i),
+            title    = tostring(item.title or ""),
+            hot      = tostring(item.hot or item.heat or item.views or "0"),
+            status   = "",
+          }
+        end
+      else
+        all_rows[#all_rows + 1] = {
+          platform = p.name,
+          rank     = "-",
+          title    = "[error] " .. tostring(data),
+          hot      = "-",
+          status   = "ERR",
+        }
+      end
+    end
+  end
+
+  -- Delta detection: mark NEW vs existing
+  local home = os.getenv("HOME") or ""
+  local cache_path = home .. "/.claw/trending-cache.txt"
+
+  local prev = {}
+  local f = io.open(cache_path, "r")
+  if f then
+    for line in f:lines() do prev[line] = true end
+    f:close()
+  end
+
+  local current = {}
+  for _, row in ipairs(all_rows) do
+    if row.status ~= "ERR" then
+      local key = row.platform .. ":" .. row.title
+      current[key] = true
+      row.status = prev[key] and "hot" or "NEW"
+    end
+  end
+
+  os.execute("mkdir -p " .. home .. "/.claw")
+  local wf = io.open(cache_path, "w")
+  if wf then
+    for key, _ in pairs(current) do wf:write(key .. "\n") end
+    wf:close()
+  end
+
+  -- Sort: NEW first, then by platform order, then by rank
+  local order = {}
+  for i, name in ipairs(wanted_order) do order[name] = i end
+  table.sort(all_rows, function(a, b)
+    if a.status == "NEW" and b.status ~= "NEW" then return true end
+    if a.status ~= "NEW" and b.status == "NEW" then return false end
+    local oa = order[a.platform] or 99
+    local ob = order[b.platform] or 99
+    if oa ~= ob then return oa < ob end
+    return (tonumber(a.rank) or 999) < (tonumber(b.rank) or 999)
+  end)
+
+  return all_rows

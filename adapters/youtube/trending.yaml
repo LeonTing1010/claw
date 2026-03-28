@@ -1,0 +1,47 @@
+site: youtube
+name: trending
+description: YouTube Trending 热门视频
+domain: youtube.com
+strategy: public
+browser: true
+
+args:
+  limit:
+    type: int
+    default: 20
+
+columns: [rank, title, hot]
+
+pipeline:
+  - navigate: https://www.youtube.com/feed/trending
+  - wait: 4
+  - evaluate: |
+      (() => {
+        const items = [];
+        // YouTube trending page uses ytd-video-renderer or ytd-rich-item-renderer
+        const videos = document.querySelectorAll('ytd-video-renderer, ytd-rich-item-renderer');
+        videos.forEach((el, i) => {
+          const titleEl = el.querySelector('#video-title, h3 a, a#video-title-link');
+          const viewsEl = el.querySelector('.inline-metadata-item, #metadata-line span, .ytd-video-meta-block');
+          const title = titleEl ? titleEl.textContent.trim() : '';
+          const views = viewsEl ? viewsEl.textContent.trim() : '0';
+          if (title) {
+            items.push({ rank: i + 1, title: title, hot: views });
+          }
+        });
+        // Fallback: generic video title extraction
+        if (items.length === 0) {
+          document.querySelectorAll('a[href*="/watch"]').forEach((a, i) => {
+            const text = (a.getAttribute('title') || a.textContent || '').trim();
+            if (text && text.length > 5 && text.length < 200 && !items.some(x => x.title === text)) {
+              items.push({ rank: i + 1, title: text, hot: '0' });
+            }
+          });
+        }
+        return items;
+      })()
+  - map:
+      rank: ${{ item.rank }}
+      title: ${{ item.title }}
+      hot: ${{ item.hot }}
+  - limit: ${{ args.limit }}

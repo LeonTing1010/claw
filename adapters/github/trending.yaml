@@ -4,6 +4,9 @@ description: GitHub Trending repositories
 domain: github.com
 strategy: public
 browser: true
+version: "2"
+last_forged: "2026-03-27"
+forged_by: "claude-opus-4"
 
 args:
   limit:
@@ -12,21 +15,32 @@ args:
 
 columns: [repo, description, stars, language]
 
-pipeline:
-  - navigate: https://github.com/trending
-  - wait: 3
-  - evaluate: |
-      (() => {
-        return Array.from(document.querySelectorAll('article.Box-row')).map(el => ({
-          repo: (el.querySelector('h2 a') || {}).textContent?.trim().replace(/\s+/g, '') || '',
-          description: (el.querySelector('p') || {}).textContent?.trim() || '',
-          stars: (el.querySelector('[href$="/stargazers"]') || {}).textContent?.trim() || '',
-          language: (el.querySelector('[itemprop="programmingLanguage"]') || {}).textContent?.trim() || ''
-        }));
-      })()
-  - map:
-      repo: ${{ item.repo }}
-      description: ${{ item.description }}
-      stars: ${{ item.stars }}
-      language: ${{ item.language }}
-  - limit: ${{ args.limit }}
+run: |
+  page:goto("https://github.com/trending")
+  page:wait_for_selector("article.Box-row", 10)
+
+  local data = page:evaluate([[
+    (() => {
+      return Array.from(document.querySelectorAll('article.Box-row')).map(el => ({
+        repo: (el.querySelector('h2 a') || {}).textContent?.trim().replace(/\s+/g, '') || '',
+        description: (el.querySelector('p') || {}).textContent?.trim() || '',
+        stars: (el.querySelector('[href$="/stargazers"]') || {}).textContent?.trim() || '',
+        language: (el.querySelector('[itemprop="programmingLanguage"]') || {}).textContent?.trim() || ''
+      }));
+    })()
+  ]])
+
+  local rows = {}
+  local limit = args.limit or 10
+  if type(data) == "table" then
+    for i, item in ipairs(data) do
+      if i > limit then break end
+      rows[#rows + 1] = {
+        repo = item.repo or "",
+        description = item.description or "",
+        stars = item.stars or "",
+        language = item.language or ""
+      }
+    end
+  end
+  return rows

@@ -1,0 +1,45 @@
+site: hackernews
+name: hot
+description: Hacker News 热门帖子
+domain: news.ycombinator.com
+strategy: public
+browser: true
+
+args:
+  limit:
+    type: int
+    default: 20
+
+columns: [rank, title, hot]
+
+pipeline:
+  - navigate: https://news.ycombinator.com/
+  - wait: 2
+  - evaluate: |
+      (() => {
+        // HN has a very stable DOM structure
+        const items = [];
+        const rows = document.querySelectorAll('.athing');
+        rows.forEach((row) => {
+          const rank = (row.querySelector('.rank') || {}).textContent || '';
+          const titleEl = row.querySelector('.titleline > a');
+          const title = titleEl ? titleEl.textContent.trim() : '';
+          // Score is in the next sibling row
+          const subRow = row.nextElementSibling;
+          const scoreEl = subRow ? subRow.querySelector('.score') : null;
+          const score = scoreEl ? scoreEl.textContent.replace(/[^0-9]/g, '') : '0';
+          if (title) {
+            items.push({
+              rank: rank.replace('.', '').trim() || String(items.length + 1),
+              title: title,
+              hot: score
+            });
+          }
+        });
+        return items;
+      })()
+  - map:
+      rank: ${{ item.rank }}
+      title: ${{ item.title }}
+      hot: ${{ item.hot }}
+  - limit: ${{ args.limit }}

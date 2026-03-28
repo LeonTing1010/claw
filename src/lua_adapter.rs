@@ -33,16 +33,22 @@ where
 }
 
 /// Execute a Lua adapter file, returning columns and structured rows.
+/// `depth` tracks recursive adapter calls for `claw.run()`.
 pub async fn execute_lua_adapter(
     path: &str,
     client: CdpClient,
     args: HashMap<String, Value>,
+    depth: u8,
 ) -> Result<(Vec<String>, Vec<HashMap<String, String>>), Box<dyn std::error::Error>> {
     let source = std::fs::read_to_string(path)?;
 
     // Run the Lua execution in block_in_place since Lua is sync
     let result = tokio::task::spawn_blocking(move || {
         let lua = Lua::new();
+
+        // Create the `claw` table with run() for adapter composition
+        let claw = create_claw_table(&lua, client.clone(), depth)?;
+        lua.globals().set("claw", claw)?;
 
         // Create the `page` table with all CDP methods
         let page = create_page_table(&lua, client)?;
@@ -103,6 +109,74 @@ pub async fn execute_lua_adapter(
         let rows = lua_table_to_rows(&result, &columns)?;
 
         Ok::<_, Box<dyn std::error::Error + Send + Sync>>((columns, rows))
+    })
+    .await
+    .map_err(|e| -> Box<dyn std::error::Error> { Box::new(e) })?
+    .map_err(|e| -> Box<dyn std::error::Error> { e })?;
+
+    Ok(result)
+}
+
+/// Execute an inline Lua script from a YAML adapter's `run:` field.
+/// The script body is wrapped in `function(page, args) ... end` and called.
+/// `depth` tracks recursive adapter calls for `claw.run()`.
+pub async fn execute_inline_lua(
+    script: &str,
+    columns: &[String],
+    client: CdpClient,
+    args: HashMap<String, Value>,
+    depth: u8,
+) -> Result<Vec<HashMap<String, String>>, Box<dyn std::error::Error>> {
+    let script = script.to_string();
+    let columns = columns.to_vec();
+
+    let result = tokio::task::spawn_blocking(move || {
+        let lua = Lua::new();
+
+        // Create the `claw` table with run() for adapter composition
+        let claw = create_claw_table(&lua, client.clone(), depth)?;
+        lua.globals().set("claw", claw)?;
+
+        let page = create_page_table(&lua, client)?;
+        lua.globals().set("page", page)?;
+
+        let args_table = lua.create_table()?;
+        for (k, v) in &args {
+            match v {
+                Value::String(s) => args_table.set(k.as_str(), s.as_str())?,
+                Value::Number(n) => {
+                    if let Some(i) = n.as_i64() {
+                        args_table.set(k.as_str(), i)?;
+                    } else if let Some(f) = n.as_f64() {
+                        args_table.set(k.as_str(), f)?;
+                    }
+                }
+                Value::Bool(b) => args_table.set(k.as_str(), *b)?,
+                _ => args_table.set(k.as_str(), v.to_string())?,
+            }
+        }
+        lua.globals().set("args", args_table)?;
+
+        lua.globals().set(
+            "split",
+            lua.create_function(|lua, (s, sep): (String, String)| {
+                let parts: Vec<&str> = s.split(&sep).map(|p| p.trim()).collect();
+                let table = lua.create_table()?;
+                for (i, part) in parts.iter().enumerate() {
+                    table.set(i + 1, *part)?;
+                }
+                Ok(table)
+            })?,
+        )?;
+
+        // Wrap the script in a function and call it with page and args
+        let wrapped = format!(
+            "local __fn = function(page, args)\n{}\nend\nreturn __fn(page, args)",
+            script
+        );
+        let result: LuaTable = lua.load(&wrapped).eval()?;
+        let rows = lua_table_to_rows(&result, &columns)?;
+        Ok::<_, Box<dyn std::error::Error + Send + Sync>>(rows)
     })
     .await
     .map_err(|e| -> Box<dyn std::error::Error> { Box::new(e) })?
@@ -177,6 +251,68 @@ fn lua_table_to_rows(
     }
 
     Ok(rows)
+}
+
+/// Create the `claw` table with adapter composition methods.
+/// `claw.run(site, name, args?)` calls another adapter and returns its rows as a Lua table.
+fn create_claw_table(lua: &Lua, client: CdpClient, depth: u8) -> LuaResult<LuaTable> {
+    let claw = lua.create_table()?;
+
+    let c = client;
+    let d = depth;
+    claw.set(
+        "run",
+        lua.create_function(
+            move |lua, (site, name, args_opt): (String, String, Option<LuaTable>)| {
+                let client = c.clone();
+
+                // Convert Lua args table to HashMap<String, Value>
+                let mut args_map = HashMap::new();
+                if let Some(args_table) = args_opt {
+                    for pair in args_table.pairs::<String, LuaValue>() {
+                        let (k, v) = pair?;
+                        let json_val = match &v {
+                            LuaValue::String(s) => Value::String(
+                                s.to_str()
+                                    .map_err(|e| LuaError::external(e.to_string()))?
+                                    .to_string(),
+                            ),
+                            LuaValue::Integer(i) => Value::Number((*i).into()),
+                            LuaValue::Number(f) => Value::Number(
+                                serde_json::Number::from_f64(*f)
+                                    .ok_or_else(|| LuaError::external("invalid float"))?,
+                            ),
+                            LuaValue::Boolean(b) => Value::Bool(*b),
+                            _ => continue, // skip non-scalar values
+                        };
+                        args_map.insert(k, json_val);
+                    }
+                }
+
+                block_async(async {
+                    let (_, rows) =
+                        crate::adapter::run_adapter(&client, &site, &name, args_map, d + 1)
+                            .await
+                            .map_err(|e| -> Box<dyn std::error::Error> { e })?;
+                    // Convert Vec<HashMap<String, String>> → JSON array → Lua table
+                    let json_rows: Vec<Value> = rows
+                        .iter()
+                        .map(|r| {
+                            let obj: serde_json::Map<String, Value> = r
+                                .iter()
+                                .map(|(k, v)| (k.clone(), Value::String(v.clone())))
+                                .collect();
+                            Value::Object(obj)
+                        })
+                        .collect();
+                    json_to_lua_value(lua, &Value::Array(json_rows))
+                        .map_err(|e| -> Box<dyn std::error::Error> { Box::new(e) })
+                })
+            },
+        )?,
+    )?;
+
+    Ok(claw)
 }
 
 /// Create the `page` table with CDP methods.
@@ -393,7 +529,7 @@ fn create_page_table(lua: &Lua, client: CdpClient) -> LuaResult<LuaTable> {
 }
 
 /// Convert a serde_json::Value to a Lua value.
-fn json_to_lua_value(lua: &Lua, value: &Value) -> LuaResult<LuaValue> {
+pub fn json_to_lua_value(lua: &Lua, value: &Value) -> LuaResult<LuaValue> {
     match value {
         Value::Null => Ok(LuaValue::Nil),
         Value::Bool(b) => Ok(LuaValue::Boolean(*b)),
@@ -419,5 +555,142 @@ fn json_to_lua_value(lua: &Lua, value: &Value) -> LuaResult<LuaValue> {
             }
             Ok(LuaValue::Table(table))
         }
+    }
+}
+
+/// Convert a Lua value back to serde_json::Value.
+pub fn lua_value_to_json(value: &LuaValue) -> Value {
+    match value {
+        LuaValue::Nil => Value::Null,
+        LuaValue::Boolean(b) => Value::Bool(*b),
+        LuaValue::Integer(i) => Value::Number((*i).into()),
+        LuaValue::Number(f) => Value::Number(
+            serde_json::Number::from_f64(*f).unwrap_or_else(|| serde_json::Number::from(0)),
+        ),
+        LuaValue::String(s) => Value::String(s.to_string_lossy().to_string()),
+        LuaValue::Table(t) => {
+            let len = t.raw_len();
+            if len > 0 {
+                let mut arr = Vec::with_capacity(len);
+                for i in 1..=len {
+                    match t.raw_get::<LuaValue>(i) {
+                        Ok(v) => arr.push(lua_value_to_json(&v)),
+                        Err(_) => arr.push(Value::Null),
+                    }
+                }
+                Value::Array(arr)
+            } else {
+                let mut map = serde_json::Map::new();
+                for (k, v) in t.pairs::<String, LuaValue>().flatten() {
+                    map.insert(k, lua_value_to_json(&v));
+                }
+                if map.is_empty() {
+                    Value::Array(vec![])
+                } else {
+                    Value::Object(map)
+                }
+            }
+        }
+        _ => Value::Null,
+    }
+}
+
+/// Lua helper functions available in transform steps.
+const TRANSFORM_HELPERS: &str = r#"
+function sort_by(tbl, field, order)
+    table.sort(tbl, function(a, b)
+        local va, vb = a[field], b[field]
+        if va == nil then return false end
+        if vb == nil then return true end
+        if order == "desc" then
+            return va > vb
+        else
+            return va < vb
+        end
+    end)
+    return tbl
+end
+
+function limit(tbl, n)
+    local result = {}
+    for i = 1, math.min(n, #tbl) do
+        result[i] = tbl[i]
+    end
+    return result
+end
+
+function pick(tbl, ...)
+    local fields = {...}
+    local result = {}
+    for i, item in ipairs(tbl) do
+        local row = {}
+        for _, f in ipairs(fields) do
+            row[f] = item[f]
+        end
+        result[i] = row
+    end
+    return result
+end
+
+function group_by(tbl, field)
+    local groups = {}
+    local order = {}
+    for _, item in ipairs(tbl) do
+        local key = tostring(item[field])
+        if not groups[key] then
+            groups[key] = {}
+            order[#order + 1] = key
+        end
+        local g = groups[key]
+        g[#g + 1] = item
+    end
+    local result = {}
+    for _, key in ipairs(order) do
+        result[#result + 1] = { key = key, items = groups[key], count = #groups[key] }
+    end
+    return result
+end
+
+function unique_by(tbl, field)
+    local seen = {}
+    local result = {}
+    for _, item in ipairs(tbl) do
+        local key = tostring(item[field])
+        if not seen[key] then
+            seen[key] = true
+            result[#result + 1] = item
+        end
+    end
+    return result
+end
+"#;
+
+/// Execute a Lua transform on pipeline data.
+/// The script receives `data` (array of JSON values) and `args` as globals,
+/// plus helpers: sort_by, limit, pick, group_by, unique_by.
+pub fn execute_transform(
+    script: &str,
+    data: &[Value],
+    args: &HashMap<String, Value>,
+) -> Result<Vec<Value>, Box<dyn std::error::Error + Send + Sync>> {
+    let lua = Lua::new();
+
+    let data_lua = json_to_lua_value(&lua, &Value::Array(data.to_vec()))?;
+    lua.globals().set("data", data_lua)?;
+
+    let args_table = lua.create_table()?;
+    for (k, v) in args {
+        let lua_val = json_to_lua_value(&lua, v)?;
+        args_table.set(k.as_str(), lua_val)?;
+    }
+    lua.globals().set("args", args_table)?;
+
+    lua.load(TRANSFORM_HELPERS).exec()?;
+
+    let result: LuaValue = lua.load(script).eval()?;
+    let json_result = lua_value_to_json(&result);
+    match json_result {
+        Value::Array(arr) => Ok(arr),
+        other => Ok(vec![other]),
     }
 }
