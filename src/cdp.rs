@@ -8,6 +8,81 @@ use tokio::net::TcpStream;
 use tokio::sync::{mpsc, oneshot, Mutex};
 use tokio_tungstenite::{connect_async, tungstenite::Message, MaybeTlsStream, WebSocketStream};
 
+/// Stealth JavaScript injected via Page.addScriptToEvaluateOnNewDocument.
+/// Patches headless Chrome detection vectors before any page JS runs.
+const STEALTH_JS: &str = r#"
+// 1. navigator.webdriver → undefined
+Object.defineProperty(navigator, 'webdriver', {
+    get: () => undefined,
+});
+
+// 2. window.chrome runtime stub
+if (!window.chrome) {
+    window.chrome = {};
+}
+if (!window.chrome.runtime) {
+    window.chrome.runtime = {};
+}
+
+// 3. navigator.plugins — headless has empty plugins
+Object.defineProperty(navigator, 'plugins', {
+    get: () => {
+        const plugins = [
+            { name: 'Chrome PDF Plugin', filename: 'internal-pdf-viewer', description: 'Portable Document Format', length: 1 },
+            { name: 'Chrome PDF Viewer', filename: 'mhjfbmdgcfjbbpaeojofohoefgiehjai', description: '', length: 1 },
+            { name: 'Native Client', filename: 'internal-nacl-plugin', description: '', length: 2 },
+        ];
+        plugins.forEach((p, i) => { plugins[i] = Object.assign(Object.create(Plugin.prototype), p); });
+        const list = Object.create(PluginArray.prototype);
+        plugins.forEach((p, i) => { list[i] = p; });
+        Object.defineProperty(list, 'length', { get: () => plugins.length });
+        return list;
+    },
+});
+
+// 4. navigator.languages
+Object.defineProperty(navigator, 'languages', {
+    get: () => ['en-US', 'en'],
+});
+
+// 5. Permissions.query — headless returns "denied" for notifications
+if (navigator.permissions) {
+    const originalQuery = navigator.permissions.query.bind(navigator.permissions);
+    navigator.permissions.query = (params) => {
+        if (params.name === 'notifications') {
+            return Promise.resolve({ state: Notification.permission });
+        }
+        return originalQuery(params);
+    };
+}
+
+// 6. WebGL renderer — headless returns "Google SwiftShader"
+(function() {
+    const getParameter = WebGLRenderingContext.prototype.getParameter;
+    WebGLRenderingContext.prototype.getParameter = function(param) {
+        if (param === 37445) { return 'Intel Inc.'; }
+        if (param === 37446) { return 'Intel Iris OpenGL Engine'; }
+        return getParameter.call(this, param);
+    };
+    if (typeof WebGL2RenderingContext !== 'undefined') {
+        const getParameter2 = WebGL2RenderingContext.prototype.getParameter;
+        WebGL2RenderingContext.prototype.getParameter = function(param) {
+            if (param === 37445) { return 'Intel Inc.'; }
+            if (param === 37446) { return 'Intel Iris OpenGL Engine'; }
+            return getParameter2.call(this, param);
+        };
+    }
+})();
+
+// 7. window.outerWidth/outerHeight — 0 in headless
+if (window.outerWidth === 0) {
+    Object.defineProperty(window, 'outerWidth', { get: () => window.innerWidth });
+}
+if (window.outerHeight === 0) {
+    Object.defineProperty(window, 'outerHeight', { get: () => window.innerHeight });
+}
+"#;
+
 /// CDP JSON-RPC request
 #[derive(Debug, Serialize)]
 pub struct CdpRequest {
@@ -264,14 +339,29 @@ impl CdpClient {
             .await;
         });
 
-        Ok(Self {
+        let client = Self {
             tx,
             pending,
             next_id: Arc::new(Mutex::new(1)),
             network_log,
             pending_requests,
             network_capture_active,
-        })
+        };
+        client.ensure_stealth().await?;
+        Ok(client)
+    }
+
+    /// Inject stealth patches before any page load.
+    /// Uses Page.addScriptToEvaluateOnNewDocument — a CDP protocol command
+    /// that runs JS before each page's main script context initializes.
+    async fn ensure_stealth(&self) -> Result<(), Box<dyn std::error::Error>> {
+        self.send("Page.enable", None).await?;
+        self.send(
+            "Page.addScriptToEvaluateOnNewDocument",
+            Some(serde_json::json!({ "source": STEALTH_JS })),
+        )
+        .await?;
+        Ok(())
     }
 
     async fn read_loop(
@@ -1702,6 +1792,36 @@ mod tests {
         let targets: Vec<Value> = vec![];
         let result = CdpClient::pick_page_ws_url(&targets);
         assert!(result.is_err());
+    }
+
+    // --- Stealth tests ---
+
+    #[test]
+    fn stealth_js_contains_webdriver_patch() {
+        assert!(STEALTH_JS.contains("webdriver"));
+        assert!(STEALTH_JS.contains("defineProperty"));
+    }
+
+    #[test]
+    fn stealth_js_contains_chrome_runtime() {
+        assert!(STEALTH_JS.contains("chrome"));
+        assert!(STEALTH_JS.contains("runtime"));
+    }
+
+    #[test]
+    fn stealth_js_contains_plugins_patch() {
+        assert!(STEALTH_JS.contains("plugins"));
+    }
+
+    #[test]
+    fn stealth_js_balanced_syntax() {
+        let opens: usize = STEALTH_JS.matches('(').count();
+        let closes: usize = STEALTH_JS.matches(')').count();
+        assert_eq!(opens, closes, "unbalanced parentheses in STEALTH_JS");
+
+        let open_braces: usize = STEALTH_JS.matches('{').count();
+        let close_braces: usize = STEALTH_JS.matches('}').count();
+        assert_eq!(open_braces, close_braces, "unbalanced braces in STEALTH_JS");
     }
 
     // --- HTTP parsing behavioral tests ---

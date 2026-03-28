@@ -1,0 +1,33 @@
+site: reddit
+name: hot
+description: Reddit Hot Posts
+strategy: public
+browser: false
+version: "1"
+last_forged: "2026-03-28"
+forged_by: "claude-opus-4"
+
+args:
+  limit:
+    type: int
+    default: 20
+
+columns: [rank, title, subreddit, score]
+
+pipeline:
+  - fetch:
+      url: https://www.reddit.com/r/popular/hot.json?limit=50&raw_json=1
+      headers:
+        User-Agent: "Mozilla/5.0 (compatible; Claw/1.0)"
+  - select: data.children
+  - transform: |
+      local result = {}
+      for i, child in ipairs(data) do
+        local d = child.data or child
+        table.insert(result, {
+          rank = i, title = d.title or "",
+          subreddit = d.subreddit or "", score = d.score or 0
+        })
+      end
+      return result
+  - limit: ${{ args.limit }}

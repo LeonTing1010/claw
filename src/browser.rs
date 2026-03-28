@@ -13,6 +13,8 @@ fn chrome_launch_args(port: u16, headless: bool, profile_dir: &std::path::Path) 
         "--disable-translate".to_string(),
         "--disable-default-apps".to_string(),
         "--disable-component-update".to_string(),
+        // Anti-detection: suppress navigator.webdriver at Blink engine level
+        "--disable-blink-features=AutomationControlled".to_string(),
     ];
     if headless {
         args.push("--headless=new".to_string());
@@ -160,5 +162,19 @@ mod tests {
         let dir = std::path::Path::new("/tmp/test-profile");
         let args = chrome_launch_args(9222, false, dir);
         assert!(!args.iter().any(|a| a.contains("headless")));
+    }
+
+    #[test]
+    fn chrome_launch_args_anti_automation_headless() {
+        let dir = std::path::Path::new("/tmp/test-profile");
+        let args = chrome_launch_args(9222, true, dir);
+        assert!(args.contains(&"--disable-blink-features=AutomationControlled".to_string()));
+    }
+
+    #[test]
+    fn chrome_launch_args_anti_automation_non_headless() {
+        let dir = std::path::Path::new("/tmp/test-profile");
+        let args = chrome_launch_args(9222, false, dir);
+        assert!(args.contains(&"--disable-blink-features=AutomationControlled".to_string()));
     }
 }

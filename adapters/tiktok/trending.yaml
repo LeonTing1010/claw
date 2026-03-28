@@ -1,0 +1,35 @@
+site: tiktok
+name: trending
+description: TikTok Trending Videos
+domain: tiktok.com
+strategy: intercept
+browser: true
+version: "1"
+last_forged: "2026-03-28"
+forged_by: "claude-opus-4"
+
+args:
+  limit:
+    type: int
+    default: 20
+
+columns: [rank, title, author, plays]
+
+pipeline:
+  - intercept:
+      trigger: "navigate: https://www.tiktok.com/explore"
+      capture: "/api/recommend/item_list"
+      timeout: 15
+      select: itemList
+  - transform: |
+      local result = {}
+      for i, item in ipairs(data) do
+        table.insert(result, {
+          rank = i,
+          title = item.desc or "",
+          author = (item.author or {}).uniqueId or "",
+          plays = (item.stats or {}).playCount or 0
+        })
+      end
+      return result
+  - limit: ${{ args.limit }}

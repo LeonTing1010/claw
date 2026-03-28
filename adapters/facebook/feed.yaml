@@ -1,0 +1,52 @@
+site: facebook
+name: feed
+description: Facebook News Feed
+domain: facebook.com
+strategy: intercept
+browser: true
+version: "1"
+last_forged: "2026-03-28"
+forged_by: "claude-opus-4"
+
+args:
+  limit:
+    type: int
+    default: 20
+
+columns: [rank, author, text, url]
+
+pipeline:
+  - intercept:
+      trigger: "navigate: https://www.facebook.com/"
+      capture: "/api/graphql"
+      timeout: 15
+  - transform: |
+      local items = {}
+      local function extract(obj)
+        if type(obj) ~= "table" then return end
+        if obj.__typename == "Story" and obj.message then
+          table.insert(items, obj)
+          return
+        end
+        for _, v in pairs(obj) do
+          if type(v) == "table" then extract(v) end
+        end
+      end
+      extract(data)
+      local result = {}
+      for i, story in ipairs(items) do
+        local text = ""
+        if story.message and story.message.text then
+          text = story.message.text
+        end
+        local author = ""
+        if story.actors and #story.actors > 0 then
+          author = story.actors[1].name or ""
+        end
+        table.insert(result, {
+          rank = i, author = author,
+          text = string.sub(text, 1, 200), url = story.url or ""
+        })
+      end
+      return result
+  - limit: ${{ args.limit }}

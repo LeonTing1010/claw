@@ -1,0 +1,58 @@
+site: instagram
+name: explore
+description: Instagram Explore
+domain: instagram.com
+strategy: intercept
+browser: true
+version: "1"
+last_forged: "2026-03-28"
+forged_by: "claude-opus-4"
+
+args:
+  limit:
+    type: int
+    default: 20
+
+columns: [rank, caption, author, likes]
+
+pipeline:
+  - intercept:
+      trigger: "navigate: https://www.instagram.com/explore/"
+      capture: "/graphql/query"
+      timeout: 15
+  - transform: |
+      local items = {}
+      local function extract(obj)
+        if type(obj) ~= "table" then return end
+        if obj.shortcode and (obj.edge_media_preview_like or obj.like_count) then
+          table.insert(items, obj)
+          return
+        end
+        for _, v in pairs(obj) do
+          if type(v) == "table" then extract(v) end
+        end
+      end
+      extract(data)
+      local result = {}
+      for i, media in ipairs(items) do
+        local caption = ""
+        if media.edge_media_to_caption and media.edge_media_to_caption.edges
+           and #media.edge_media_to_caption.edges > 0 then
+          caption = media.edge_media_to_caption.edges[1].node.text or ""
+        elseif media.caption and media.caption.text then
+          caption = media.caption.text
+        end
+        local likes = 0
+        if media.edge_media_preview_like then
+          likes = media.edge_media_preview_like.count or 0
+        elseif media.like_count then
+          likes = media.like_count
+        end
+        table.insert(result, {
+          rank = i, caption = string.sub(caption, 1, 200),
+          author = (media.owner or {}).username or "",
+          likes = likes
+        })
+      end
+      return result
+  - limit: ${{ args.limit }}

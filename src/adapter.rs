@@ -1367,4 +1367,272 @@ pipeline:
             "depth limit should prevent runaway recursion"
         );
     }
+
+    // --- Anti-scraping site adapter parse tests ---
+
+    const REDDIT_HOT_YAML: &str = r#"
+site: reddit
+name: hot
+description: Reddit Hot Posts
+strategy: public
+browser: false
+version: "1"
+last_forged: "2026-03-28"
+forged_by: "claude-opus-4"
+
+args:
+  limit:
+    type: int
+    default: 20
+
+columns: [rank, title, subreddit, score]
+
+pipeline:
+  - fetch:
+      url: https://www.reddit.com/r/popular/hot.json?limit=50&raw_json=1
+      headers:
+        User-Agent: "Mozilla/5.0 (compatible; Claw/1.0)"
+  - select: data.children
+  - transform: |
+      local result = {}
+      for i, child in ipairs(data) do
+        local d = child.data or child
+        table.insert(result, {
+          rank = i, title = d.title or "",
+          subreddit = d.subreddit or "", score = d.score or 0
+        })
+      end
+      return result
+  - limit: ${{ args.limit }}
+"#;
+
+    #[test]
+    fn parse_reddit_hot_yaml() {
+        let adapter: Adapter = serde_yml::from_str(REDDIT_HOT_YAML).unwrap();
+        assert_eq!(adapter.site, "reddit");
+        assert_eq!(adapter.name, "hot");
+        assert_eq!(adapter.strategy, Some("public".to_string()));
+        assert_eq!(adapter.browser, Some(false));
+        assert_eq!(adapter.columns, vec!["rank", "title", "subreddit", "score"]);
+        // First step should be Fetch
+        match &adapter.pipeline[0] {
+            PipelineStep::Fetch { url, .. } => {
+                assert!(url.contains("reddit.com"));
+                assert!(url.contains(".json"));
+            }
+            _ => panic!("expected Fetch as first pipeline step"),
+        }
+    }
+
+    const TIKTOK_TRENDING_YAML: &str = r#"
+site: tiktok
+name: trending
+description: TikTok Trending Videos
+domain: tiktok.com
+strategy: intercept
+browser: true
+version: "1"
+last_forged: "2026-03-28"
+forged_by: "claude-opus-4"
+
+args:
+  limit:
+    type: int
+    default: 20
+
+columns: [rank, title, author, plays]
+
+pipeline:
+  - intercept:
+      trigger: "navigate: https://www.tiktok.com/explore"
+      capture: "/api/recommend/item_list"
+      timeout: 15
+      select: itemList
+  - transform: |
+      local result = {}
+      for i, item in ipairs(data) do
+        table.insert(result, {
+          rank = i,
+          title = item.desc or "",
+          author = (item.author or {}).uniqueId or "",
+          plays = (item.stats or {}).playCount or 0
+        })
+      end
+      return result
+  - limit: ${{ args.limit }}
+"#;
+
+    #[test]
+    fn parse_tiktok_trending_yaml() {
+        let adapter: Adapter = serde_yml::from_str(TIKTOK_TRENDING_YAML).unwrap();
+        assert_eq!(adapter.site, "tiktok");
+        assert_eq!(adapter.name, "trending");
+        assert_eq!(adapter.strategy, Some("intercept".to_string()));
+        assert_eq!(adapter.browser, Some(true));
+        assert_eq!(adapter.columns, vec!["rank", "title", "author", "plays"]);
+        // First step should be Intercept
+        match &adapter.pipeline[0] {
+            PipelineStep::Intercept {
+                trigger, capture, ..
+            } => {
+                assert!(trigger.contains("tiktok.com/explore"));
+                assert!(capture.contains("item_list"));
+            }
+            _ => panic!("expected Intercept as first pipeline step"),
+        }
+    }
+
+    const FACEBOOK_FEED_YAML: &str = r#"
+site: facebook
+name: feed
+description: Facebook News Feed
+domain: facebook.com
+strategy: intercept
+browser: true
+version: "1"
+last_forged: "2026-03-28"
+forged_by: "claude-opus-4"
+
+args:
+  limit:
+    type: int
+    default: 20
+
+columns: [rank, author, text, url]
+
+pipeline:
+  - intercept:
+      trigger: "navigate: https://www.facebook.com/"
+      capture: "/api/graphql"
+      timeout: 15
+  - transform: |
+      local items = {}
+      local function extract(obj)
+        if type(obj) ~= "table" then return end
+        if obj.__typename == "Story" and obj.message then
+          table.insert(items, obj)
+          return
+        end
+        for _, v in pairs(obj) do
+          if type(v) == "table" then extract(v) end
+        end
+      end
+      extract(data)
+      local result = {}
+      for i, story in ipairs(items) do
+        local text = ""
+        if story.message and story.message.text then
+          text = story.message.text
+        end
+        local author = ""
+        if story.actors and #story.actors > 0 then
+          author = story.actors[1].name or ""
+        end
+        table.insert(result, {
+          rank = i, author = author,
+          text = string.sub(text, 1, 200), url = story.url or ""
+        })
+      end
+      return result
+  - limit: ${{ args.limit }}
+"#;
+
+    #[test]
+    fn parse_facebook_feed_yaml() {
+        let adapter: Adapter = serde_yml::from_str(FACEBOOK_FEED_YAML).unwrap();
+        assert_eq!(adapter.site, "facebook");
+        assert_eq!(adapter.name, "feed");
+        assert_eq!(adapter.strategy, Some("intercept".to_string()));
+        assert_eq!(adapter.browser, Some(true));
+        assert_eq!(adapter.columns, vec!["rank", "author", "text", "url"]);
+        match &adapter.pipeline[0] {
+            PipelineStep::Intercept {
+                trigger, capture, ..
+            } => {
+                assert!(trigger.contains("facebook.com"));
+                assert!(capture.contains("graphql"));
+            }
+            _ => panic!("expected Intercept as first pipeline step"),
+        }
+    }
+
+    const INSTAGRAM_EXPLORE_YAML: &str = r#"
+site: instagram
+name: explore
+description: Instagram Explore
+domain: instagram.com
+strategy: intercept
+browser: true
+version: "1"
+last_forged: "2026-03-28"
+forged_by: "claude-opus-4"
+
+args:
+  limit:
+    type: int
+    default: 20
+
+columns: [rank, caption, author, likes]
+
+pipeline:
+  - intercept:
+      trigger: "navigate: https://www.instagram.com/explore/"
+      capture: "/graphql/query"
+      timeout: 15
+  - transform: |
+      local items = {}
+      local function extract(obj)
+        if type(obj) ~= "table" then return end
+        if obj.shortcode and (obj.edge_media_preview_like or obj.like_count) then
+          table.insert(items, obj)
+          return
+        end
+        for _, v in pairs(obj) do
+          if type(v) == "table" then extract(v) end
+        end
+      end
+      extract(data)
+      local result = {}
+      for i, media in ipairs(items) do
+        local caption = ""
+        if media.edge_media_to_caption and media.edge_media_to_caption.edges
+           and #media.edge_media_to_caption.edges > 0 then
+          caption = media.edge_media_to_caption.edges[1].node.text or ""
+        elseif media.caption and media.caption.text then
+          caption = media.caption.text
+        end
+        local likes = 0
+        if media.edge_media_preview_like then
+          likes = media.edge_media_preview_like.count or 0
+        elseif media.like_count then
+          likes = media.like_count
+        end
+        table.insert(result, {
+          rank = i, caption = string.sub(caption, 1, 200),
+          author = (media.owner or {}).username or "",
+          likes = likes
+        })
+      end
+      return result
+  - limit: ${{ args.limit }}
+"#;
+
+    #[test]
+    fn parse_instagram_explore_yaml() {
+        let adapter: Adapter = serde_yml::from_str(INSTAGRAM_EXPLORE_YAML).unwrap();
+        assert_eq!(adapter.site, "instagram");
+        assert_eq!(adapter.name, "explore");
+        assert_eq!(adapter.strategy, Some("intercept".to_string()));
+        assert_eq!(adapter.browser, Some(true));
+        assert_eq!(adapter.columns, vec!["rank", "caption", "author", "likes"]);
+        match &adapter.pipeline[0] {
+            PipelineStep::Intercept {
+                trigger, capture, ..
+            } => {
+                assert!(trigger.contains("instagram.com/explore"));
+                assert!(capture.contains("graphql"));
+            }
+            _ => panic!("expected Intercept as first pipeline step"),
+        }
+    }
 }

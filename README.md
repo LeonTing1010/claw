@@ -1,12 +1,14 @@
 # Claw
 
-> **The web capability cache for AI agents.** Forge once, execute forever.
+> **The universal API layer for the web.** Grab once, run forever.
 
-AI agents explore websites and forge deterministic adapters — machine-generated API specs for sites that never built an API. At runtime, Claw executes them with zero AI: no tokens, no latency, no drift.
+Websites are closing their APIs. AI agents need them more than ever. Claw bridges the gap.
+
+AI agents grab websites and turn them into **claws** — deterministic, machine-generated API specs that run with zero AI: no tokens, no latency, no drift.
 
 ```
-AI agent ──forge──→ adapter (YAML/Lua) ──execute──→ structured data
-          (once)                         (1000x, free)
+AI agent ──grab──→ claw (YAML/Lua) ──run──→ structured data
+         (once)                     (1000x, free)
 ```
 
 Single Rust binary. Zero dependencies. CDP-native precision that works on React/Vue/Angular SPAs.

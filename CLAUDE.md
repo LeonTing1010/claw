@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-Claw is the **web capability cache for AI agents**: forge once, execute forever. AI agents explore websites and forge deterministic claws (YAML/Lua) — machine-generated API specs for websites that never built an API. At runtime, Claw executes claws with zero AI: no tokens, no latency, no non-determinism. The primary user is the AI agent, not the human. See `.claude/DESIGN.md` for full design.
+Claw is the **universal API layer for the web**. Websites are closing their APIs; AI agents need them more than ever. Claw bridges the gap — AI agents grab websites and turn them into deterministic claws (YAML/Lua), machine-generated API specs that run with zero AI at runtime. See `.claude/DESIGN.md` for full design.
 
 ## Development Workflow
 
