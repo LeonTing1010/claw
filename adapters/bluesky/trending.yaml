@@ -1,0 +1,32 @@
+site: bluesky
+name: trending
+description: Bluesky 热门话题
+domain: bsky.app
+strategy: public
+browser: true
+version: "1"
+last_forged: "2026-03-28"
+forged_by: "claude-opus-4"
+
+args:
+  limit:
+    type: int
+    default: 20
+
+columns: [rank, title]
+
+pipeline:
+  - navigate: https://bsky.app
+  - evaluate: |
+      (async () => {
+        const res = await fetch('https://public.api.bsky.app/xrpc/app.bsky.unspecced.getTrendingTopics');
+        const data = await res.json();
+        return (data.topics || []).map((t, i) => ({
+          rank: i + 1,
+          title: t.topic
+        }));
+      })()
+  - map:
+      rank: ${{ item.rank }}
+      title: ${{ item.title }}
+  - limit: ${{ args.limit }}

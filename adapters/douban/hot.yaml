@@ -1,0 +1,34 @@
+site: douban
+name: hot
+description: 豆瓣热门电影
+domain: movie.douban.com
+strategy: public
+browser: true
+version: "1"
+last_forged: "2026-03-28"
+forged_by: "claude-opus-4"
+
+args:
+  limit:
+    type: int
+    default: 20
+
+columns: [rank, title, rate]
+
+pipeline:
+  - navigate: https://movie.douban.com
+  - evaluate: |
+      (async () => {
+        const res = await fetch('https://movie.douban.com/j/search_subjects?type=movie&tag=%E7%83%AD%E9%97%A8&page_limit=50&page_start=0');
+        const data = await res.json();
+        return data.subjects.map((m, i) => ({
+          rank: i + 1,
+          title: m.title,
+          rate: m.rate || '-'
+        }));
+      })()
+  - map:
+      rank: ${{ item.rank }}
+      title: ${{ item.title }}
+      rate: ${{ item.rate }}
+  - limit: ${{ args.limit }}

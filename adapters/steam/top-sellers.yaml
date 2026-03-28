@@ -1,0 +1,36 @@
+site: steam
+name: top-sellers
+description: Steam 热销游戏
+domain: store.steampowered.com
+strategy: public
+browser: true
+version: "1"
+last_forged: "2026-03-28"
+forged_by: "claude-opus-4"
+
+args:
+  limit:
+    type: int
+    default: 20
+
+columns: [rank, title, price, discount]
+
+pipeline:
+  - navigate: https://store.steampowered.com
+  - evaluate: |
+      (async () => {
+        const res = await fetch('https://store.steampowered.com/api/featuredcategories?cc=us&l=english');
+        const data = await res.json();
+        return (data.top_sellers.items || []).map((g, i) => ({
+          rank: i + 1,
+          title: g.name,
+          price: g.final_price ? '$' + (g.final_price / 100).toFixed(2) : 'Free',
+          discount: g.discount_percent ? g.discount_percent + '% off' : '-'
+        }));
+      })()
+  - map:
+      rank: ${{ item.rank }}
+      title: ${{ item.title }}
+      price: ${{ item.price }}
+      discount: ${{ item.discount }}
+  - limit: ${{ args.limit }}

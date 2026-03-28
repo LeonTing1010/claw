@@ -1,0 +1,36 @@
+site: xueqiu
+name: hot-stock
+description: 雪球热门股票
+domain: xueqiu.com
+strategy: public
+browser: true
+version: "1"
+last_forged: "2026-03-28"
+forged_by: "claude-opus-4"
+
+args:
+  limit:
+    type: int
+    default: 20
+
+columns: [rank, title, code, percent]
+
+pipeline:
+  - navigate: https://xueqiu.com
+  - evaluate: |
+      (async () => {
+        const res = await fetch('https://stock.xueqiu.com/v5/stock/hot_stock/list.json?size=50&_type=10&type=10', { credentials: 'include' });
+        const data = await res.json();
+        return (data.data.items || []).map((s, i) => ({
+          rank: i + 1,
+          title: s.name,
+          code: s.code,
+          percent: (s.percent >= 0 ? '+' : '') + s.percent.toFixed(2) + '%'
+        }));
+      })()
+  - map:
+      rank: ${{ item.rank }}
+      title: ${{ item.title }}
+      code: ${{ item.code }}
+      percent: ${{ item.percent }}
+  - limit: ${{ args.limit }}

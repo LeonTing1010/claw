@@ -1,0 +1,38 @@
+site: devto
+name: top
+description: Dev.to 热门文章
+domain: dev.to
+strategy: public
+browser: true
+version: "1"
+last_forged: "2026-03-28"
+forged_by: "claude-opus-4"
+
+args:
+  limit:
+    type: int
+    default: 20
+
+columns: [rank, title, reactions, comments, author]
+
+pipeline:
+  - navigate: https://dev.to
+  - evaluate: |
+      (async () => {
+        const res = await fetch('https://dev.to/api/articles?per_page=50&state=rising');
+        const data = await res.json();
+        return data.map((a, i) => ({
+          rank: i + 1,
+          title: a.title,
+          reactions: a.positive_reactions_count,
+          comments: a.comments_count,
+          author: a.user.name
+        }));
+      })()
+  - map:
+      rank: ${{ item.rank }}
+      title: ${{ item.title }}
+      reactions: ${{ item.reactions }}
+      comments: ${{ item.comments }}
+      author: ${{ item.author }}
+  - limit: ${{ args.limit }}
