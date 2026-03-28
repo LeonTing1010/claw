@@ -291,7 +291,7 @@ fn create_claw_table(lua: &Lua, client: CdpClient, depth: u8) -> LuaResult<LuaTa
 
                 block_async(async {
                     let (_, rows) =
-                        crate::adapter::run_adapter(&client, &site, &name, args_map, d + 1)
+                        crate::adapter::run_adapter(Some(&client), &site, &name, args_map, d + 1)
                             .await
                             .map_err(|e| -> Box<dyn std::error::Error> { e })?;
                     // Convert Vec<HashMap<String, String>> → JSON array → Lua table

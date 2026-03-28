@@ -3,8 +3,8 @@ name: trending
 description: Bluesky 热门话题
 domain: bsky.app
 strategy: public
-browser: true
-version: "1"
+browser: false
+version: "2"
 last_forged: "2026-03-28"
 forged_by: "claude-opus-4"
 
@@ -13,20 +13,11 @@ args:
     type: int
     default: 20
 
-columns: [rank, title]
+columns: [topic]
 
 pipeline:
-  - navigate: https://bsky.app
-  - evaluate: |
-      (async () => {
-        const res = await fetch('https://public.api.bsky.app/xrpc/app.bsky.unspecced.getTrendingTopics');
-        const data = await res.json();
-        return (data.topics || []).map((t, i) => ({
-          rank: i + 1,
-          title: t.topic
-        }));
-      })()
+  - fetch: https://public.api.bsky.app/xrpc/app.bsky.unspecced.getTrendingTopics
+  - select: topics
   - map:
-      rank: ${{ item.rank }}
-      title: ${{ item.title }}
+      topic: ${{ item.topic }}
   - limit: ${{ args.limit }}

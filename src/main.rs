@@ -259,6 +259,31 @@ enum Command {
         name: String,
     },
 
+    /// Auto-generate a claw YAML from minimal inputs
+    Forge {
+        /// Site name (becomes directory under adapters/)
+        #[arg(long)]
+        site: String,
+        /// Claw name (becomes filename.yaml)
+        #[arg(long)]
+        name: String,
+        /// Description of what this claw does
+        #[arg(long, default_value = "")]
+        description: String,
+        /// API URL to fetch
+        #[arg(long)]
+        url: String,
+        /// JSON path to the array in the response (empty = response is already an array)
+        #[arg(long, default_value = "")]
+        select: String,
+        /// Field mappings: output_name:source_path,... (__index = array index + 1)
+        #[arg(long)]
+        fields: String,
+        /// Max results to return
+        #[arg(long, default_value_t = 20)]
+        limit: u32,
+    },
+
     /// Open a site in the browser for manual login (cookie persists in ~/.claw/chrome-profile/)
     Login {
         /// Site domain or site name (e.g. jimeng, xiaohongshu, bilibili)
@@ -627,9 +652,15 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             let start = std::time::Instant::now();
             let mut data = Vec::new();
             let mut rows = Vec::new();
-            let result =
-                pipeline::execute_single_step(&parsed, &client, &args, &mut data, &mut rows, 0)
-                    .await;
+            let result = pipeline::execute_single_step(
+                &parsed,
+                Some(&client),
+                &args,
+                &mut data,
+                &mut rows,
+                0,
+            )
+            .await;
             let duration_ms = start.elapsed().as_millis();
 
             let (status, error, suggestion) = match result {
@@ -679,7 +710,8 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             let ws_url = cdp::CdpClient::discover_ws_url(cli.port).await?;
             let client = cdp::CdpClient::connect(&ws_url).await?;
 
-            let results = pipeline::execute_with_report(&ada.pipeline, &client, args, 0).await;
+            let results =
+                pipeline::execute_with_report(&ada.pipeline, Some(&client), args, 0).await;
 
             let pass_count = results.iter().filter(|r| r.status == "pass").count();
             let total = results.len();
@@ -733,6 +765,29 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
 
             std::fs::copy(&backup, &target)?;
             println!("rolled back {}/{} from {}", site, name, backup);
+        }
+
+        Command::Forge {
+            site,
+            name,
+            description,
+            url,
+            select,
+            fields,
+            limit,
+        } => {
+            let yaml =
+                generate_grab_yaml(&site, &name, &description, &url, &select, &fields, limit);
+
+            // Write to adapters/{site}/{name}.yaml
+            let dir = format!("adapters/{}", site);
+            std::fs::create_dir_all(&dir)?;
+            let path = format!("{}/{}.yaml", dir, name);
+            std::fs::write(&path, &yaml)?;
+
+            // Print the generated YAML
+            println!("{}", yaml);
+            eprintln!("wrote {}", path);
         }
 
         Command::Login { site } => {
@@ -817,24 +872,186 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                     args.insert(k, v);
                 }
 
-                browser::ensure_chrome(cli.port, cli.headless).await?;
-                let ws_url = cdp::CdpClient::discover_ws_url(cli.port).await?;
-                let client = cdp::CdpClient::connect(&ws_url).await?;
+                // Determine if browser is needed: explicit browser: true, inline Lua, or default (None = true for backward compat)
+                let needs_browser = ada.run.is_some() || ada.browser != Some(false);
 
-                // run: Lua or pipeline: YAML
-                if let Some(ref script) = ada.run {
-                    let rows =
-                        lua_adapter::execute_inline_lua(script, &ada.columns, client, args, 0)
-                            .await?;
-                    output::print_output(&ada.columns, &rows, &format)?;
+                if needs_browser {
+                    browser::ensure_chrome(cli.port, cli.headless).await?;
+                    let ws_url = cdp::CdpClient::discover_ws_url(cli.port).await?;
+                    let client = cdp::CdpClient::connect(&ws_url).await?;
+
+                    // run: Lua or pipeline: YAML
+                    if let Some(ref script) = ada.run {
+                        let rows =
+                            lua_adapter::execute_inline_lua(script, &ada.columns, client, args, 0)
+                                .await?;
+                        output::print_output(&ada.columns, &rows, &format)?;
+                    } else {
+                        let rows = pipeline::execute(&ada.pipeline, Some(&client), args, 0).await?;
+                        output::print_output(&ada.columns, &rows, &format)?;
+                    }
                 } else {
-                    let rows = pipeline::execute(&ada.pipeline, &client, args, 0).await?;
+                    // No browser needed - run pipeline without CDP connection
+                    let rows = pipeline::execute(&ada.pipeline, None, args, 0).await?;
                     output::print_output(&ada.columns, &rows, &format)?;
                 }
             }
         }
     }
     Ok(())
+}
+
+/// A single field mapping parsed from --fields input.
+struct FieldMapping {
+    /// Column name shown in output
+    column: String,
+    /// Template expression for the map step value
+    template: String,
+}
+
+/// Parse the --fields string into column names and map entries.
+///
+/// Format: "output_name:source_path,..." where:
+/// - `name` alone means `name:name` (same source and output)
+/// - `output:source` maps source to output column
+/// - `__index` is special: replaced with array index + 1
+/// - `source.method(args)` like `tags.join(', ')` is preserved as-is
+///
+/// Commas inside parentheses are not treated as field separators.
+fn parse_fields(fields: &str) -> Vec<FieldMapping> {
+    let entries = split_respecting_parens(fields);
+
+    entries
+        .iter()
+        .filter(|s| !s.trim().is_empty())
+        .map(|entry| {
+            let entry = entry.trim();
+            if let Some((col, source)) = entry.split_once(':') {
+                let col = col.trim();
+                let source = source.trim();
+                if source == "__index" {
+                    FieldMapping {
+                        column: col.to_string(),
+                        template: "__index".to_string(),
+                    }
+                } else {
+                    FieldMapping {
+                        column: col.to_string(),
+                        template: format!("${{{{ item.{} }}}}", source),
+                    }
+                }
+            } else {
+                FieldMapping {
+                    column: entry.to_string(),
+                    template: format!("${{{{ item.{} }}}}", entry),
+                }
+            }
+        })
+        .collect()
+}
+
+/// Split a string on commas, but ignore commas inside parentheses.
+fn split_respecting_parens(s: &str) -> Vec<String> {
+    let mut result = Vec::new();
+    let mut current = String::new();
+    let mut depth = 0u32;
+    for ch in s.chars() {
+        match ch {
+            '(' => {
+                depth += 1;
+                current.push(ch);
+            }
+            ')' => {
+                depth = depth.saturating_sub(1);
+                current.push(ch);
+            }
+            ',' if depth == 0 => {
+                result.push(current.clone());
+                current.clear();
+            }
+            _ => current.push(ch),
+        }
+    }
+    if !current.is_empty() {
+        result.push(current);
+    }
+    result
+}
+
+/// Generate a claw YAML string for a read-api adapter.
+fn generate_grab_yaml(
+    site: &str,
+    name: &str,
+    description: &str,
+    url: &str,
+    select: &str,
+    fields: &str,
+    limit: u32,
+) -> String {
+    let mappings = parse_fields(fields);
+    let columns: Vec<&str> = mappings.iter().map(|m| m.column.as_str()).collect();
+
+    // Build the map block lines
+    let map_lines: Vec<String> = mappings
+        .iter()
+        .map(|m| {
+            if m.template == "__index" {
+                // __index gets resolved at evaluate time, so we wire it as item.__index
+                format!("      {}: ${{{{ item.__index }}}}", m.column)
+            } else {
+                format!("      {}: {}", m.column, m.template)
+            }
+        })
+        .collect();
+
+    // Build the evaluate JS that handles __index injection
+    let has_index = mappings.iter().any(|m| m.template == "__index");
+
+    let today = "2026-03-28"; // last_forged timestamp
+
+    let mut yaml = String::new();
+    yaml.push_str(&format!("site: {}\n", site));
+    yaml.push_str(&format!("name: {}\n", name));
+    if !description.is_empty() {
+        yaml.push_str(&format!("description: \"{}\"\n", description));
+    }
+    yaml.push_str("strategy: public\n");
+    yaml.push_str("browser: false\n");
+    yaml.push_str("version: \"1\"\n");
+    yaml.push_str(&format!("last_forged: \"{}\"\n", today));
+    yaml.push_str("forged_by: \"claw-forge\"\n");
+    yaml.push('\n');
+    yaml.push_str("args:\n");
+    yaml.push_str("  limit:\n");
+    yaml.push_str("    type: int\n");
+    yaml.push_str(&format!("    default: {}\n", limit));
+    yaml.push('\n');
+    yaml.push_str(&format!("columns: [{}]\n", columns.join(", ")));
+    yaml.push('\n');
+    yaml.push_str("pipeline:\n");
+    yaml.push_str(&format!("  - fetch: {}\n", url));
+
+    if !select.is_empty() {
+        yaml.push_str(&format!("  - select: {}\n", select));
+    }
+
+    if has_index {
+        // Inject __index field via a transform step
+        yaml.push_str("  - transform: |\n");
+        yaml.push_str("      for i, row in ipairs(data) do\n");
+        yaml.push_str("        row.__index = i\n");
+        yaml.push_str("      end\n");
+        yaml.push_str("      return data\n");
+    }
+
+    yaml.push_str("  - map:\n");
+    for line in &map_lines {
+        yaml.push_str(line);
+        yaml.push('\n');
+    }
+    yaml.push_str("  - limit: ${{ args.limit }}\n");
+
+    yaml
 }
 
 /// Parse --key value pairs from raw CLI args into a HashMap.
@@ -892,5 +1109,104 @@ mod tests {
         let raw: Vec<String> = vec!["--verbose"].into_iter().map(String::from).collect();
         let args = parse_adapter_args(&raw);
         assert_eq!(args.get("verbose"), Some(&json!(true)));
+    }
+
+    #[test]
+    fn parse_fields_simple() {
+        let fields = parse_fields("title,url");
+        assert_eq!(fields.len(), 2);
+        assert_eq!(fields[0].column, "title");
+        assert_eq!(fields[0].template, "${{ item.title }}");
+        assert_eq!(fields[1].column, "url");
+        assert_eq!(fields[1].template, "${{ item.url }}");
+    }
+
+    #[test]
+    fn parse_fields_with_source_path() {
+        let fields = parse_fields("comments:comment_count");
+        assert_eq!(fields.len(), 1);
+        assert_eq!(fields[0].column, "comments");
+        assert_eq!(fields[0].template, "${{ item.comment_count }}");
+    }
+
+    #[test]
+    fn parse_fields_with_index() {
+        let fields = parse_fields("rank:__index,title");
+        assert_eq!(fields.len(), 2);
+        assert_eq!(fields[0].column, "rank");
+        assert_eq!(fields[0].template, "__index");
+        assert_eq!(fields[1].column, "title");
+        assert_eq!(fields[1].template, "${{ item.title }}");
+    }
+
+    #[test]
+    fn parse_fields_with_dotted_source() {
+        let fields = parse_fields("tags:tags.join(', ')");
+        assert_eq!(fields[0].column, "tags");
+        assert_eq!(fields[0].template, "${{ item.tags.join(', ') }}");
+    }
+
+    #[test]
+    fn generate_grab_yaml_basic() {
+        let yaml = generate_grab_yaml(
+            "example",
+            "feed",
+            "Example feed",
+            "https://api.example.com/feed",
+            "data.items",
+            "title,url",
+            10,
+        );
+        assert!(yaml.contains("site: example"));
+        assert!(yaml.contains("name: feed"));
+        assert!(yaml.contains("description: \"Example feed\""));
+        assert!(yaml.contains("browser: false"));
+        assert!(yaml.contains("strategy: public"));
+        assert!(yaml.contains("columns: [title, url]"));
+        assert!(yaml.contains("- fetch: https://api.example.com/feed"));
+        assert!(yaml.contains("- select: data.items"));
+        assert!(yaml.contains("      title: ${{ item.title }}"));
+        assert!(yaml.contains("      url: ${{ item.url }}"));
+        assert!(yaml.contains("- limit: ${{ args.limit }}"));
+        assert!(yaml.contains("default: 10"));
+        // No transform step when no __index
+        assert!(!yaml.contains("transform"));
+    }
+
+    #[test]
+    fn generate_grab_yaml_no_select() {
+        let yaml = generate_grab_yaml(
+            "lobsters",
+            "hot",
+            "",
+            "https://lobste.rs/hottest.json",
+            "",
+            "title,score",
+            20,
+        );
+        // No select step when select is empty
+        assert!(!yaml.contains("- select:"));
+        // No description when empty
+        assert!(!yaml.contains("description:"));
+    }
+
+    #[test]
+    fn generate_grab_yaml_with_index() {
+        let yaml = generate_grab_yaml(
+            "lobsters",
+            "hot",
+            "Lobsters hot posts",
+            "https://lobste.rs/hottest.json",
+            "",
+            "rank:__index,title,score,tags:tags.join(', '),comments:comment_count",
+            20,
+        );
+        assert!(yaml.contains("columns: [rank, title, score, tags, comments]"));
+        assert!(yaml.contains("- transform:"));
+        assert!(yaml.contains("row.__index = i"));
+        assert!(yaml.contains("      rank: ${{ item.__index }}"));
+        assert!(yaml.contains("      title: ${{ item.title }}"));
+        assert!(yaml.contains("      tags: ${{ item.tags.join(', ') }}"));
+        assert!(yaml.contains("      comments: ${{ item.comment_count }}"));
     }
 }

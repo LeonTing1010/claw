@@ -515,9 +515,8 @@ fn deserialize_pipeline_inner<E: serde::de::Error>(
                 PipelineStep::Filter(s)
             }
             "transform" => {
-                let s = yml_value_to_string(&value).ok_or_else(|| {
-                    serde::de::Error::custom("transform value must be a string")
-                })?;
+                let s = yml_value_to_string(&value)
+                    .ok_or_else(|| serde::de::Error::custom("transform value must be a string"))?;
                 PipelineStep::Transform(s)
             }
             "intercept" => {
@@ -906,7 +905,7 @@ fn send_err(e: impl std::fmt::Display) -> SendErr {
 ///
 /// Returns a boxed future to support async recursion (adapter A can `use:` adapter B).
 pub fn run_adapter<'a>(
-    client: &'a crate::cdp::CdpClient,
+    client: Option<&'a crate::cdp::CdpClient>,
     site: &'a str,
     name: &'a str,
     args: HashMap<String, serde_json::Value>,
@@ -926,6 +925,9 @@ pub fn run_adapter<'a>(
 
         // Try Lua adapter first
         if let Some(lua_path) = find_lua_adapter(&refs, site, name) {
+            let client = client.ok_or_else(|| {
+                send_err("Lua adapter requires a browser connection, but browser is not enabled")
+            })?;
             return crate::lua_adapter::execute_lua_adapter(&lua_path, client.clone(), args, depth)
                 .await
                 .map_err(send_err);
@@ -948,6 +950,11 @@ pub fn run_adapter<'a>(
         }
 
         if let Some(ref script) = ada.run {
+            let client = client.ok_or_else(|| {
+                send_err(
+                    "Inline Lua adapter requires a browser connection, but browser is not enabled",
+                )
+            })?;
             let rows = crate::lua_adapter::execute_inline_lua(
                 script,
                 &ada.columns,

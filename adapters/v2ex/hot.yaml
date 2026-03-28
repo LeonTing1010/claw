@@ -3,8 +3,8 @@ name: hot
 description: V2EX 热门话题
 domain: v2ex.com
 strategy: public
-browser: true
-version: "1"
+browser: false
+version: "2"
 last_forged: "2026-03-28"
 forged_by: "claude-opus-4"
 
@@ -13,24 +13,12 @@ args:
     type: int
     default: 20
 
-columns: [rank, title, node, replies]
+columns: [title, node, replies]
 
 pipeline:
-  - navigate: https://www.v2ex.com
-  - evaluate: |
-      (async () => {
-        const res = await fetch('https://www.v2ex.com/api/topics/hot.json');
-        const data = await res.json();
-        return data.map((t, i) => ({
-          rank: i + 1,
-          title: t.title,
-          node: t.node.title,
-          replies: t.replies
-        }));
-      })()
+  - fetch: https://www.v2ex.com/api/topics/hot.json
   - map:
-      rank: ${{ item.rank }}
       title: ${{ item.title }}
-      node: ${{ item.node }}
+      node: ${{ item.node.title }}
       replies: ${{ item.replies }}
   - limit: ${{ args.limit }}

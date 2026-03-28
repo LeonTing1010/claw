@@ -8,9 +8,18 @@ use crate::template::{self, TemplateContext};
 
 /// Execute the adapter pipeline and return rows (each row is column → value).
 /// `depth` tracks recursive adapter calls (for `use:` steps) to prevent infinite loops.
+/// Return a reference to the CdpClient, or a clear error when browser is not connected.
+fn require_browser(client: Option<&CdpClient>) -> Result<&CdpClient, Box<dyn std::error::Error>> {
+    client.ok_or_else(|| {
+        "this step requires a browser connection, but the adapter has browser: false".into()
+    })
+}
+
+/// Execute the adapter pipeline and return rows (each row is column -> value).
+/// `client` may be `None` for adapters that only use non-browser steps (fetch, map, etc.).
 pub async fn execute(
     steps: &[PipelineStep],
-    client: &CdpClient,
+    client: Option<&CdpClient>,
     args: HashMap<String, Value>,
     depth: u8,
 ) -> Result<Vec<HashMap<String, String>>, Box<dyn std::error::Error>> {
@@ -259,7 +268,7 @@ pub fn suggest_fix(error: &str) -> Option<String> {
 /// Does not stop on first failure — runs all steps and reports health.
 pub async fn execute_with_report(
     steps: &[PipelineStep],
-    client: &CdpClient,
+    client: Option<&CdpClient>,
     args: HashMap<String, Value>,
     depth: u8,
 ) -> Vec<StepResult> {
@@ -280,18 +289,23 @@ pub async fn execute_with_report(
                 let err_str = e.to_string();
                 let sug = suggest_fix(&err_str);
                 // Capture page state on failure for diagnostics
-                let url = client
-                    .evaluate("location.href")
-                    .await
-                    .ok()
-                    .and_then(|v| v.as_str().map(|s| s.to_string()));
-                let screenshot = {
+                let url = if let Some(c) = client {
+                    c.evaluate("location.href")
+                        .await
+                        .ok()
+                        .and_then(|v| v.as_str().map(|s| s.to_string()))
+                } else {
+                    None
+                };
+                let screenshot = if let Some(c) = client {
                     let path = format!("/tmp/verify-step-{}.png", i);
-                    if client.screenshot(&path).await.is_ok() {
+                    if c.screenshot(&path).await.is_ok() {
                         Some(path)
                     } else {
                         None
                     }
+                } else {
+                    None
                 };
                 ("fail".to_string(), Some(err_str), sug, url, screenshot)
             }
@@ -316,7 +330,7 @@ pub async fn execute_with_report(
 /// `depth` tracks recursive adapter calls for the `use:` step.
 pub async fn execute_single_step(
     step: &PipelineStep,
-    client: &CdpClient,
+    client: Option<&CdpClient>,
     args: &HashMap<String, Value>,
     data: &mut Vec<Value>,
     rows: &mut Vec<HashMap<String, String>>,
@@ -324,6 +338,7 @@ pub async fn execute_single_step(
 ) -> Result<(), Box<dyn std::error::Error>> {
     match step {
         PipelineStep::Navigate(url) => {
+            let client = require_browser(client)?;
             let ctx = TemplateContext {
                 args: args.clone(),
                 item: None,
@@ -332,6 +347,7 @@ pub async fn execute_single_step(
             client.navigate(&rendered).await?;
         }
         PipelineStep::Evaluate(js) => {
+            let client = require_browser(client)?;
             let ctx = TemplateContext {
                 args: args.clone(),
                 item: None,
@@ -358,6 +374,7 @@ pub async fn execute_single_step(
             tokio::time::sleep(std::time::Duration::from_secs_f64(secs)).await;
         }
         PipelineStep::Click(tmpl) => {
+            let client = require_browser(client)?;
             let ctx = TemplateContext {
                 args: args.clone(),
                 item: None,
@@ -366,6 +383,7 @@ pub async fn execute_single_step(
             client.click_text(&text).await?;
         }
         PipelineStep::ClickSelector(tmpl) => {
+            let client = require_browser(client)?;
             let ctx = TemplateContext {
                 args: args.clone(),
                 item: None,
@@ -374,6 +392,7 @@ pub async fn execute_single_step(
             client.click_selector(&selector).await?;
         }
         PipelineStep::Type { selector, text } => {
+            let client = require_browser(client)?;
             let ctx = TemplateContext {
                 args: args.clone(),
                 item: None,
@@ -383,6 +402,7 @@ pub async fn execute_single_step(
             client.type_into(&sel, &txt).await?;
         }
         PipelineStep::Upload { selector, files } => {
+            let client = require_browser(client)?;
             let ctx = TemplateContext {
                 args: args.clone(),
                 item: None,
@@ -393,6 +413,7 @@ pub async fn execute_single_step(
             client.upload_files(&sel, &paths).await?;
         }
         PipelineStep::WaitFor { selector, timeout } => {
+            let client = require_browser(client)?;
             let ctx = TemplateContext {
                 args: args.clone(),
                 item: None,
@@ -402,6 +423,7 @@ pub async fn execute_single_step(
             client.wait_for_selector(&sel, secs).await?;
         }
         PipelineStep::WaitForText { text, timeout } => {
+            let client = require_browser(client)?;
             let ctx = TemplateContext {
                 args: args.clone(),
                 item: None,
@@ -411,6 +433,7 @@ pub async fn execute_single_step(
             client.wait_for_text(&txt, secs).await?;
         }
         PipelineStep::WaitForUrl { pattern, timeout } => {
+            let client = require_browser(client)?;
             let ctx = TemplateContext {
                 args: args.clone(),
                 item: None,
@@ -420,6 +443,7 @@ pub async fn execute_single_step(
             client.wait_for_url(&pat, secs).await?;
         }
         PipelineStep::WaitForNetworkIdle(timeout) => {
+            let client = require_browser(client)?;
             let ctx = TemplateContext {
                 args: args.clone(),
                 item: None,
@@ -428,6 +452,7 @@ pub async fn execute_single_step(
             client.wait_for_network_idle(secs).await?;
         }
         PipelineStep::Screenshot(path) => {
+            let client = require_browser(client)?;
             let ctx = TemplateContext {
                 args: args.clone(),
                 item: None,
@@ -436,6 +461,7 @@ pub async fn execute_single_step(
             client.screenshot(&p).await?;
         }
         PipelineStep::Hover(text) => {
+            let client = require_browser(client)?;
             let ctx = TemplateContext {
                 args: args.clone(),
                 item: None,
@@ -466,6 +492,7 @@ pub async fn execute_single_step(
             client.hover_at(x, y).await?;
         }
         PipelineStep::HoverSelector(selector) => {
+            let client = require_browser(client)?;
             let ctx = TemplateContext {
                 args: args.clone(),
                 item: None,
@@ -474,6 +501,7 @@ pub async fn execute_single_step(
             client.hover_selector(&sel).await?;
         }
         PipelineStep::Scroll(selector) => {
+            let client = require_browser(client)?;
             let ctx = TemplateContext {
                 args: args.clone(),
                 item: None,
@@ -482,6 +510,7 @@ pub async fn execute_single_step(
             client.scroll_into_view(&sel).await?;
         }
         PipelineStep::ScrollBy { x, y } => {
+            let client = require_browser(client)?;
             let ctx = TemplateContext {
                 args: args.clone(),
                 item: None,
@@ -491,6 +520,7 @@ pub async fn execute_single_step(
             client.scroll_by(dx, dy).await?;
         }
         PipelineStep::PressKey { key, modifiers } => {
+            let client = require_browser(client)?;
             let ctx = TemplateContext {
                 args: args.clone(),
                 item: None,
@@ -500,6 +530,7 @@ pub async fn execute_single_step(
             client.press_key(&k, m).await?;
         }
         PipelineStep::Select { selector, value } => {
+            let client = require_browser(client)?;
             let ctx = TemplateContext {
                 args: args.clone(),
                 item: None,
@@ -509,6 +540,7 @@ pub async fn execute_single_step(
             client.select_option(&sel, &val).await?;
         }
         PipelineStep::DismissDialog(accept) => {
+            let client = require_browser(client)?;
             let ctx = TemplateContext {
                 args: args.clone(),
                 item: None,
@@ -518,6 +550,7 @@ pub async fn execute_single_step(
             client.dismiss_dialog(do_accept, None).await?;
         }
         PipelineStep::AssertSelector(selector) => {
+            let client = require_browser(client)?;
             let ctx = TemplateContext {
                 args: args.clone(),
                 item: None,
@@ -526,6 +559,7 @@ pub async fn execute_single_step(
             client.assert_selector(&sel).await?;
         }
         PipelineStep::AssertText(text) => {
+            let client = require_browser(client)?;
             let ctx = TemplateContext {
                 args: args.clone(),
                 item: None,
@@ -534,6 +568,7 @@ pub async fn execute_single_step(
             client.assert_text(&txt).await?;
         }
         PipelineStep::AssertUrl(pattern) => {
+            let client = require_browser(client)?;
             let ctx = TemplateContext {
                 args: args.clone(),
                 item: None,
@@ -542,6 +577,7 @@ pub async fn execute_single_step(
             client.assert_url(&pat).await?;
         }
         PipelineStep::AssertNotSelector(selector) => {
+            let client = require_browser(client)?;
             let ctx = TemplateContext {
                 args: args.clone(),
                 item: None,
@@ -553,6 +589,7 @@ pub async fn execute_single_step(
             selector,
             then_steps,
         } => {
+            let client = require_browser(client)?;
             let ctx = TemplateContext {
                 args: args.clone(),
                 item: None,
@@ -567,11 +604,20 @@ pub async fn execute_single_step(
             let condition = client.evaluate(&js).await.ok() == Some(serde_json::Value::Bool(true));
             if condition {
                 for sub in then_steps {
-                    Box::pin(execute_single_step(sub, client, args, data, rows, depth)).await?;
+                    Box::pin(execute_single_step(
+                        sub,
+                        Some(client),
+                        args,
+                        data,
+                        rows,
+                        depth,
+                    ))
+                    .await?;
                 }
             }
         }
         PipelineStep::IfText { text, then_steps } => {
+            let client = require_browser(client)?;
             let ctx = TemplateContext {
                 args: args.clone(),
                 item: None,
@@ -584,7 +630,15 @@ pub async fn execute_single_step(
             let condition = client.evaluate(&js).await.ok() == Some(serde_json::Value::Bool(true));
             if condition {
                 for sub in then_steps {
-                    Box::pin(execute_single_step(sub, client, args, data, rows, depth)).await?;
+                    Box::pin(execute_single_step(
+                        sub,
+                        Some(client),
+                        args,
+                        data,
+                        rows,
+                        depth,
+                    ))
+                    .await?;
                 }
             }
         }
@@ -592,6 +646,7 @@ pub async fn execute_single_step(
             pattern,
             then_steps,
         } => {
+            let client = require_browser(client)?;
             let ctx = TemplateContext {
                 args: args.clone(),
                 item: None,
@@ -604,7 +659,15 @@ pub async fn execute_single_step(
             let condition = client.evaluate(&js).await.ok() == Some(serde_json::Value::Bool(true));
             if condition {
                 for sub in then_steps {
-                    Box::pin(execute_single_step(sub, client, args, data, rows, depth)).await?;
+                    Box::pin(execute_single_step(
+                        sub,
+                        Some(client),
+                        args,
+                        data,
+                        rows,
+                        depth,
+                    ))
+                    .await?;
                 }
             }
         }
@@ -726,6 +789,7 @@ pub async fn execute_single_step(
             timeout,
             select,
         } => {
+            let client = require_browser(client)?;
             let ctx = TemplateContext {
                 args: args.clone(),
                 item: None,

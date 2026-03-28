@@ -4,8 +4,7 @@ use serde_json::Value;
 
 const REPO_TREE_URL: &str =
     "https://api.github.com/repos/LeonTing1010/claw/git/trees/master?recursive=1";
-const RAW_BASE_URL: &str =
-    "https://raw.githubusercontent.com/LeonTing1010/claw/master/adapters";
+const RAW_BASE_URL: &str = "https://raw.githubusercontent.com/LeonTing1010/claw/master/adapters";
 
 /// Returns true if ~/.claw/adapters/ is empty or does not exist.
 pub fn needs_sync() -> bool {
@@ -42,9 +41,7 @@ pub async fn sync_claws() -> Result<(), Box<dyn std::error::Error>> {
     let home = std::env::var("HOME")?;
     let target_dir = format!("{}/.claw/adapters", home);
 
-    let http = reqwest::Client::builder()
-        .user_agent("claw-cli")
-        .build()?;
+    let http = reqwest::Client::builder().user_agent("claw-cli").build()?;
 
     // 1. List remote adapter files via GitHub Trees API (single call)
     let tree_resp: Value = http.get(REPO_TREE_URL).send().await?.json().await?;

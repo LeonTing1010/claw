@@ -609,7 +609,8 @@ async fn execute_tool(
             }
 
             let results =
-                crate::pipeline::execute_with_report(&ada.pipeline, client, adapter_args, 0).await;
+                crate::pipeline::execute_with_report(&ada.pipeline, Some(client), adapter_args, 0)
+                    .await;
             Ok(json!(results))
         }
         "try_step" => {
@@ -628,7 +629,12 @@ async fn execute_tool(
             let mut data = Vec::new();
             let mut rows = Vec::new();
             let result = crate::pipeline::execute_single_step(
-                &parsed, client, &step_args, &mut data, &mut rows, 0,
+                &parsed,
+                Some(client),
+                &step_args,
+                &mut data,
+                &mut rows,
+                0,
             )
             .await;
             let duration_ms = start.elapsed().as_millis();
@@ -686,9 +692,10 @@ async fn execute_tool(
                     adapter_args.insert(k.clone(), v.clone());
                 }
             }
-            let (columns, rows) = crate::adapter::run_adapter(client, site, name, adapter_args, 0)
-                .await
-                .map_err(|e| -> Box<dyn std::error::Error> { e })?;
+            let (columns, rows) =
+                crate::adapter::run_adapter(Some(client), site, name, adapter_args, 0)
+                    .await
+                    .map_err(|e| -> Box<dyn std::error::Error> { e })?;
             let json_rows: Vec<Value> = rows
                 .iter()
                 .map(|row| {
