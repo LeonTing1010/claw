@@ -17,4 +17,3 @@ serde_yml = "0.0.12"
 regex = "1.12"
 tabled = "0.20"
 futures-util = "0.3.32"
-reqwest = { version = "0.12", features = ["json"] }

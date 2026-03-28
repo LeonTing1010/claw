@@ -5,7 +5,6 @@ mod cdp;
 mod health;
 mod mcp;
 mod output;
-mod sync;
 
 use clap::{CommandFactory, Parser, Subcommand};
 use clap_complete::{generate, Shell};
@@ -31,8 +30,6 @@ struct Cli {
 enum Command {
     /// List available claws (website API specs)
     List,
-    /// Download/update claws from GitHub
-    Sync,
     /// Generate shell completions
     Completions {
         /// Shell: bash, zsh, fish, powershell, elvish
@@ -66,16 +63,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         Command::Mcp => {
             mcp::serve().await?;
         }
-        Command::Sync => {
-            sync::sync_claws().await?;
-        }
         Command::List => {
-            if sync::needs_sync() {
-                eprintln!("First run — syncing claws from GitHub...");
-                if let Err(e) = sync::sync_claws().await {
-                    eprintln!("Warning: sync failed ({}). Continuing with local claws.", e);
-                }
-            }
             let dirs = adapter::adapter_base_dirs();
             let refs: Vec<&str> = dirs.iter().map(|s| s.as_str()).collect();
             let adapters = adapter::list_adapters(&refs);
