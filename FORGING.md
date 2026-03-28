@@ -1,6 +1,6 @@
-# Forging Spec
+# Grab Spec
 
-How to create claws. For AI forge agents, not humans.
+How to create claws. For AI agents, not humans.
 
 ## 1. Decision Tree
 

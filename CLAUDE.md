@@ -34,8 +34,8 @@ Use the `/constraint-driven-development` skill for any feature, bug fix, or busi
 
 ### Architecture
 
-- **User-facing text says "claw", code says "adapter".** The brand name is "claw" (as in: "forge a claw for weibo"). Internal variables, function names, file paths keep `adapter` to avoid a massive rename. Don't rename code internals.
-- **MCP tools are the primary AI interface.** `list_adapters` and `run_adapter` for execution, 28 forge tools for creation. CLI is secondary (for humans).
+- **User-facing text says "claw", code says "adapter".** The brand name is "claw" (as in: "grab a claw for weibo"). Internal variables, function names, file paths keep `adapter` to avoid a massive rename. Don't rename code internals.
+- **MCP tools are the primary AI interface.** `list_adapters` and `run_adapter` for execution, 28 grab tools for creation. CLI is secondary (for humans).
 - **Don't optimize mechanical repetition.** The 25 `TemplateContext` blocks in pipeline.rs, the deserialization match branches — these are intentionally verbose. They don't drift, don't cause bugs, and are easier to read than macros/helpers. See engineering philosophy §8 Core Warning.
 
 ## Build & Development Commands

@@ -27,15 +27,26 @@ if (!window.chrome.runtime) {
 // 3. navigator.plugins — headless has empty plugins
 Object.defineProperty(navigator, 'plugins', {
     get: () => {
+        const makePlugin = (name, filename, desc, len) => {
+            const p = {};
+            Object.defineProperties(p, {
+                name: { get: () => name },
+                filename: { get: () => filename },
+                description: { get: () => desc },
+                length: { get: () => len },
+            });
+            return p;
+        };
         const plugins = [
-            { name: 'Chrome PDF Plugin', filename: 'internal-pdf-viewer', description: 'Portable Document Format', length: 1 },
-            { name: 'Chrome PDF Viewer', filename: 'mhjfbmdgcfjbbpaeojofohoefgiehjai', description: '', length: 1 },
-            { name: 'Native Client', filename: 'internal-nacl-plugin', description: '', length: 2 },
+            makePlugin('Chrome PDF Plugin', 'internal-pdf-viewer', 'Portable Document Format', 1),
+            makePlugin('Chrome PDF Viewer', 'mhjfbmdgcfjbbpaeojofohoefgiehjai', '', 1),
+            makePlugin('Native Client', 'internal-nacl-plugin', '', 2),
         ];
-        plugins.forEach((p, i) => { plugins[i] = Object.assign(Object.create(Plugin.prototype), p); });
-        const list = Object.create(PluginArray.prototype);
+        const list = { length: plugins.length };
         plugins.forEach((p, i) => { list[i] = p; });
-        Object.defineProperty(list, 'length', { get: () => plugins.length });
+        list.item = (i) => plugins[i] || null;
+        list.namedItem = (n) => plugins.find(p => p.name === n) || null;
+        list.refresh = () => {};
         return list;
     },
 });
