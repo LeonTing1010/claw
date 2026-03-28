@@ -373,6 +373,57 @@ async function withDebugger(fn) {
   return await fn()
 }
 
+// --- Omnibox: claw:// protocol via address bar ---
+
+chrome.omnibox.onInputSuggestion = undefined // suppress default
+
+chrome.omnibox.onInputChanged.addListener((text, suggest) => {
+  const claws = listClaws()
+  const matches = text.trim()
+    ? claws.filter(c => `${c.site}/${c.name}`.includes(text.trim()))
+    : claws
+
+  suggest(matches.slice(0, 8).map(c => ({
+    content: `${c.site}/${c.name}`,
+    description: `<match>${c.site}/${c.name}</match> — ${c.description || 'no description'}`
+  })))
+})
+
+chrome.omnibox.onInputEntered.addListener((text, disposition) => {
+  // text is "site/name?args" — open results page
+  const resultsUrl = chrome.runtime.getURL(`results.html#${text.trim()}`)
+
+  if (disposition === 'currentTab') {
+    chrome.tabs.update({ url: resultsUrl })
+  } else {
+    chrome.tabs.create({ url: resultsUrl })
+  }
+})
+
+// --- showResults action (from content script) ---
+
+// Handle showResults in the message router
+const originalHandleMessage = handleMessage
+// Extend handleClawAction to support showResults
+const _origClawAction = handleClawAction
+async function handleShowResults(msg) {
+  if (msg.action === 'showResults') {
+    const hash = msg.url.replace('claw://', '')
+    const resultsUrl = chrome.runtime.getURL(`results.html#${hash}`)
+    chrome.tabs.create({ url: resultsUrl })
+    return { ok: true }
+  }
+  return null
+}
+
+// Patch message listeners to handle showResults
+chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
+  if (msg.action === 'showResults') {
+    handleShowResults(msg).then(sendResponse)
+    return true
+  }
+})
+
 // --- Start ---
 
 connectBridge()
@@ -384,4 +435,4 @@ chrome.alarms.onAlarm.addListener((alarm) => {
   }
 })
 
-console.log('[claw] v2 ready — one extension, all capabilities')
+console.log('[claw] v2 ready — claw:// protocol active')

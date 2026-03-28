@@ -7,7 +7,7 @@ use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
 use crate::bridge::BridgeServer;
-use crate::cdp::CdpClient;
+use crate::cdp::BridgeClient;
 
 /// Run the MCP server: read JSON-RPC from stdin, write responses to stdout.
 pub async fn serve() -> Result<(), Box<dyn std::error::Error>> {
@@ -614,7 +614,7 @@ fn tools_schema() -> Value {
     ])
 }
 
-async fn handle_tool_call(id: &Value, params: &Value, client: &CdpClient) -> Value {
+async fn handle_tool_call(id: &Value, params: &Value, client: &BridgeClient) -> Value {
     let tool_name = params["name"].as_str().unwrap_or("");
     let args = &params["arguments"];
 
@@ -652,7 +652,7 @@ async fn handle_tool_call(id: &Value, params: &Value, client: &CdpClient) -> Val
 async fn execute_tool(
     name: &str,
     args: &Value,
-    client: &CdpClient,
+    client: &BridgeClient,
 ) -> Result<Value, Box<dyn std::error::Error>> {
     match name {
         "screenshot" => {
@@ -818,7 +818,7 @@ async fn execute_tool(
             let adapter_args = args.get("args").cloned().unwrap_or(json!({}));
 
             // Relay to Chrome extension via bridge
-            let result = client
+            let mut result = client
                 .send(
                     "Claw.run",
                     Some(json!({
@@ -828,6 +828,18 @@ async fn execute_tool(
                     })),
                 )
                 .await?;
+
+            // Health validation: if the result contains rows and a health contract, validate
+            if let Some(rows) = result.get("rows").and_then(|r| r.as_array()) {
+                if let Some(health_val) = result.get("health") {
+                    if let Some(contract) = crate::adapter::parse_health_contract(health_val) {
+                        let adapter_name = format!("{}/{}", site, name);
+                        let report = crate::health::validate(&adapter_name, &contract, rows);
+                        result["health_report"] = serde_json::to_value(&report).unwrap_or_default();
+                    }
+                }
+            }
+
             Ok(result)
         }
         // ===== FORGE — Claw Creation Pipeline =====

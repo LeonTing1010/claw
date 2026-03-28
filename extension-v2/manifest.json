@@ -20,6 +20,9 @@
     "service_worker": "background.js",
     "type": "module"
   },
+  "omnibox": {
+    "keyword": "claw"
+  },
   "action": {
     "default_popup": "popup.html",
     "default_icon": {
@@ -35,6 +38,19 @@
     "48": "icons/icon48.png",
     "128": "icons/icon128.png"
   },
+  "content_scripts": [
+    {
+      "matches": ["<all_urls>"],
+      "js": ["content-script.js"],
+      "run_at": "document_idle"
+    }
+  ],
+  "web_accessible_resources": [
+    {
+      "resources": ["results.html"],
+      "matches": ["<all_urls>"]
+    }
+  ],
   "externally_connectable": {
     "matches": ["<all_urls>"]
   },

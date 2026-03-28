@@ -71,7 +71,7 @@ type PendingRequests = Arc<Mutex<HashMap<String, (String, String, Option<Value>)
 
 
 #[derive(Clone)]
-pub struct CdpClient {
+pub struct BridgeClient {
     tx: mpsc::Sender<Message>,
     pending: PendingMap,
     next_id: Arc<Mutex<u64>>,
@@ -117,7 +117,7 @@ fn key_event_params(event_type: &str, key: &str, text: Option<&str>, modifiers: 
     params
 }
 
-impl CdpClient {
+impl BridgeClient {
 
     /// Connect from a raw TCP stream (used by Chrome extension bridge).
     /// Performs WebSocket handshake, then operates like a normal CDP connection.
@@ -1744,7 +1744,7 @@ mod tests {
     fn download_js_snippet_uses_fetch_and_returns_base64() {
         // The JS snippet must use fetch() (browser context) not XMLHttpRequest
         // and must return base64-encoded data for binary content
-        let js = CdpClient::download_js("https://example.com/img.png");
+        let js = BridgeClient::download_js("https://example.com/img.png");
         assert!(
             js.contains("fetch("),
             "must use fetch() for browser session"
@@ -1779,7 +1779,7 @@ mod tests {
     #[test]
     fn save_image_js_snippet_resolves_selector_src() {
         // save_image must: find element by selector → get its src/currentSrc → fetch it
-        let js = CdpClient::save_image_js("img.hero");
+        let js = BridgeClient::save_image_js("img.hero");
         assert!(
             js.contains("querySelector"),
             "must use querySelector to find element"

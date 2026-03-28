@@ -8,20 +8,20 @@ use std::sync::Arc;
 use tokio::net::TcpListener;
 use tokio::sync::Mutex;
 
-use crate::cdp::CdpClient;
+use crate::cdp::BridgeClient;
 
 const BRIDGE_PORT: u16 = 9333;
 
 /// Persistent bridge server state.
 pub struct BridgeServer {
-    client: Arc<Mutex<Option<CdpClient>>>,
+    client: Arc<Mutex<Option<BridgeClient>>>,
 }
 
 impl BridgeServer {
     /// Start the bridge server in the background.
     /// Returns immediately — listens for extension connections in a spawned task.
     pub fn start() -> Arc<Self> {
-        let client: Arc<Mutex<Option<CdpClient>>> = Arc::new(Mutex::new(None));
+        let client: Arc<Mutex<Option<BridgeClient>>> = Arc::new(Mutex::new(None));
 
         let client_clone = client.clone();
         tokio::spawn(async move {
@@ -34,13 +34,13 @@ impl BridgeServer {
     }
 
     /// Get the bridge client if extension is connected.
-    pub async fn get_client(&self) -> Option<CdpClient> {
+    pub async fn get_client(&self) -> Option<BridgeClient> {
         self.client.lock().await.clone()
     }
 }
 
 /// Background listener — accepts extension connections.
-async fn listen_loop(client_slot: Arc<Mutex<Option<CdpClient>>>) -> Result<(), String> {
+async fn listen_loop(client_slot: Arc<Mutex<Option<BridgeClient>>>) -> Result<(), String> {
     let addr = format!("127.0.0.1:{}", BRIDGE_PORT);
     let listener = TcpListener::bind(&addr)
         .await
@@ -56,7 +56,7 @@ async fn listen_loop(client_slot: Arc<Mutex<Option<CdpClient>>>) -> Result<(), S
 
         eprintln!("bridge: extension connected");
 
-        // Build CdpClient + attach — errors converted to String to stay Send
+        // Build BridgeClient + attach — errors converted to String to stay Send
         match try_connect_and_attach(stream).await {
             Ok((cdp_client, tab_id)) => {
                 eprintln!("bridge: attached to tab {}", tab_id);
@@ -70,8 +70,8 @@ async fn listen_loop(client_slot: Arc<Mutex<Option<CdpClient>>>) -> Result<(), S
 }
 
 /// Connect and attach in one step — isolates non-Send errors from the spawned task.
-async fn try_connect_and_attach(stream: tokio::net::TcpStream) -> Result<(CdpClient, i64), String> {
-    let client = CdpClient::connect_from_stream(stream)
+async fn try_connect_and_attach(stream: tokio::net::TcpStream) -> Result<(BridgeClient, i64), String> {
+    let client = BridgeClient::connect_from_stream(stream)
         .await
         .map_err(|e| format!("handshake failed: {}", e))?;
 
@@ -93,7 +93,7 @@ async fn try_connect_and_attach(stream: tokio::net::TcpStream) -> Result<(CdpCli
 
 /// Try to connect via Chrome extension bridge (blocking, with timeout).
 /// Used by CLI commands that don't have a persistent BridgeServer.
-pub async fn try_extension_bridge() -> Result<CdpClient, Box<dyn std::error::Error>> {
+pub async fn try_extension_bridge() -> Result<BridgeClient, Box<dyn std::error::Error>> {
     let addr = format!("127.0.0.1:{}", BRIDGE_PORT);
     let listener = TcpListener::bind(&addr)
         .await
@@ -108,7 +108,7 @@ pub async fn try_extension_bridge() -> Result<CdpClient, Box<dyn std::error::Err
             .map_err(|e| format!("bridge: accept failed: {}", e))?;
 
     eprintln!("bridge: extension connected");
-    let client = CdpClient::connect_from_stream(stream).await?;
+    let client = BridgeClient::connect_from_stream(stream).await?;
 
     let result = tokio::time::timeout(
         std::time::Duration::from_secs(5),

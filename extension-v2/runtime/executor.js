@@ -74,7 +74,9 @@ export async function runClaw(site, name, userArgs = {}, tabId) {
     throw new Error(`claw ${site}/${name} run() must return an array, got ${typeof rows}`)
   }
 
-  return { columns: mod.columns, rows, count: rows.length }
+  const result = { columns: mod.columns, rows, count: rows.length }
+  if (mod.health) result.health = mod.health
+  return result
 }
 
 /** Coerce argument to declared type. */
