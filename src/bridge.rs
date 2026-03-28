@@ -71,7 +71,7 @@ async fn listen_loop(client_slot: Arc<Mutex<Option<CdpClient>>>) -> Result<(), S
 
 /// Connect and attach in one step — isolates non-Send errors from the spawned task.
 async fn try_connect_and_attach(stream: tokio::net::TcpStream) -> Result<(CdpClient, i64), String> {
-    let client = CdpClient::connect_from_stream(stream, false)
+    let client = CdpClient::connect_from_stream(stream)
         .await
         .map_err(|e| format!("handshake failed: {}", e))?;
 
@@ -108,7 +108,7 @@ pub async fn try_extension_bridge() -> Result<CdpClient, Box<dyn std::error::Err
             .map_err(|e| format!("bridge: accept failed: {}", e))?;
 
     eprintln!("bridge: extension connected");
-    let client = CdpClient::connect_from_stream(stream, false).await?;
+    let client = CdpClient::connect_from_stream(stream).await?;
 
     let result = tokio::time::timeout(
         std::time::Duration::from_secs(5),

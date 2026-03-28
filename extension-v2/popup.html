@@ -1,0 +1,27 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body { width: 320px; font: 13px/1.5 -apple-system, sans-serif; background: #0a0a0a; color: #e0e0e0; padding: 16px; }
+    h1 { font-size: 16px; font-weight: 600; margin-bottom: 12px; color: #fff; }
+    h1 span { color: #ff4444; }
+    .status { font-size: 11px; color: #888; margin-bottom: 12px; }
+    .status.connected { color: #4caf50; }
+    .claw-list { list-style: none; }
+    .claw-list li { padding: 6px 8px; border-radius: 4px; margin-bottom: 4px; cursor: pointer; font-size: 12px; }
+    .claw-list li:hover { background: #1a1a1a; }
+    .claw-list .site { color: #ff6b6b; font-weight: 500; }
+    .claw-list .name { color: #fff; }
+    .claw-list .desc { color: #666; display: block; font-size: 11px; }
+    .empty { color: #555; font-style: italic; font-size: 12px; }
+  </style>
+</head>
+<body>
+  <h1><span>Claw</span></h1>
+  <div class="status" id="status">loading...</div>
+  <ul class="claw-list" id="claws"></ul>
+  <script src="popup.js"></script>
+</body>
+</html>

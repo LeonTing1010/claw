@@ -1,194 +1,224 @@
-# Grab Spec
+# Forging Spec (v2)
 
-How to create claws. For AI agents, not humans.
+How to create .claw.js files. For AI agents, not humans.
 
-## 1. Decision Tree
+## 1. Forge Workflow
 
 ```
-GOAL: Read data?
-  Public API in network log?    -> read-api    (fetch, no browser)
-  API needs cookies?            -> read-browser (navigate + evaluate w/ credentials)
-  API uses signed/CSRF params?  -> intercept   (trigger + capture response)
-  No API, data in DOM?          -> read-browser (navigate + evaluate DOM query)
-GOAL: Write/interact?           -> write-ui    (Lua run: with page:* calls)
-GOAL: Compose claws?            -> Lua run: with claw.run() calls
+page_intelligence(url)     → framework, SSR state, APIs, strategies + templates
+                           ↓
+pick strategy template     → SSR > API > DOM (in priority order)
+                           ↓
+forge_verify(url, expr)    → test extraction logic, see sample data
+                           ↓
+iterate if needed          → tweak expression, re-verify
+                           ↓
+forge_save(site, name, code) → persist to ~/.claw/claws/
 ```
 
-Recon: `network_log_start` -> `navigate` -> interact -> `network_log_dump_bodies`. API first, DOM fallback.
+3-4 MCP calls total. `page_intelligence` returns ready-to-use templates — pick one, fill TODOs, verify, save.
 
-## 2. Claw Anatomy
+## 2. .claw.js Format
 
-```yaml
-# Required
-site: weibo              # Site identifier (directory name)
-name: hot                # Command name (file stem)
-columns: [rank, title]   # Output column names
-# Plus one of: pipeline: (YAML steps) | run: (Lua script)
+```js
+export default {
+  // Required
+  site: "weibo",                       // Site identifier
+  name: "hot",                         // Claw name
+  description: "微博热搜榜",            // What it does
+  columns: ["rank", "title", "hot"],   // Output column names
 
-# Optional
-description: "What this does"
-domain: example.com                 # Cookie scoping
-strategy: public|cookie|intercept   # Auth tier
-browser: true                       # Needs Chrome
-version: "1"                        # Bump on re-forge
-last_forged: "2026-03-28"
-forged_by: "claude-opus-4"
-args:
-  limit: { type: int, default: 20 }
+  // Optional
+  args: {
+    limit: { type: "int", default: 20 },
+    keyword: { type: "string" }        // No default = required arg
+  },
+  health: {
+    min_rows: 5,                       // Minimum expected rows
+    non_empty: ["title"]               // Columns that must have values
+  },
+
+  // Required: the extraction function
+  async run(page, args) {
+    // ... use page API to extract data ...
+    return [{ rank: "1", title: "...", hot: "999" }]
+  }
+}
 ```
 
-## 3. Four Archetypes
+## 3. Page API — 10 Methods
 
-### A. Read via API (no browser)
+| Method | Mode | Description |
+|--------|------|-------------|
+| `page.nav(url)` | scripting | Navigate to URL |
+| `page.wait(ms)` | scripting | Fixed delay |
+| `page.waitFor(selector, timeoutMs)` | scripting | Wait for CSS selector to appear |
+| `page.eval(fn, ...args)` | scripting | Execute function in page context |
+| `page.fetch(url, opts)` | scripting | Fetch with page cookies |
+| `page.screenshot()` | scripting | Capture visible area |
+| `page.cookies()` | scripting | Read cookies |
+| `page.click(target)` | debugger | Click by selector or visible text |
+| `page.type(selector, text)` | debugger | Type into input |
+| `page.upload(selector, files)` | debugger | Upload files |
 
-```yaml
-site: example
-name: feed
-columns: [title, url]
-args:
-  limit: { type: int, default: 10 }
-pipeline:
-  - fetch: https://api.example.com/feed
-  - select: data.items
-  - map:
-      title: ${{ item.title }}
-      url: ${{ item.url }}
-  - limit: ${{ args.limit }}
+Scripting mode = undetectable. Debugger mode = ms-level attach/detach.
+
+## 4. Strategy Decision Tree
+
+```
+page_intelligence returned strategies?
+  Has SSR state (__NEXT_DATA__, __pinia, etc.)?
+    → SSR strategy: page.eval(() => window.__STATE__) — zero requests
+  Has API endpoints in api_hints?
+    → API strategy: page.fetch(apiUrl) — one request, reliable
+  Neither?
+    → DOM strategy: page.eval(() => querySelectorAll(...)) — always works
 ```
 
-### B. Read via Browser (DOM or cookie-auth API)
+## 5. Three Archetypes
 
-```yaml
-site: hackernews
-name: hot
-domain: news.ycombinator.com
-strategy: public
-browser: true
-columns: [rank, title, hot]
-pipeline:
-  - navigate: https://news.ycombinator.com/
-  - wait: 2
-  - evaluate: |
-      (() => {
-        const rows = document.querySelectorAll('.athing');
-        return [...rows].map((row, i) => ({
-          rank: i + 1,
-          title: row.querySelector('.titleline > a')?.textContent || '',
-          hot: row.nextElementSibling?.querySelector('.score')?.textContent?.replace(/\D/g,'') || '0'
-        }));
-      })()
-  - map:
-      rank: ${{ item.rank }}
-      title: ${{ item.title }}
-      hot: ${{ item.hot }}
-  - limit: ${{ args.limit }}
+### A. SSR State Extraction (fastest, most reliable)
+
+```js
+export default {
+  site: "xiaohongshu",
+  name: "hot",
+  description: "小红书热门",
+  columns: ["title", "likes", "url"],
+  args: { limit: { type: "int", default: 20 } },
+
+  async run(page, args) {
+    await page.nav("https://www.xiaohongshu.com/explore")
+    await page.wait(2000)
+
+    const items = await page.eval(() => {
+      // SSR state — look for __INITIAL_SSR_STATE__, __pinia, etc.
+      const state = window.__INITIAL_SSR_STATE__
+      return state.feed.items.map(item => ({
+        title: item.title,
+        likes: String(item.likes_count),
+        url: 'https://www.xiaohongshu.com/explore/' + item.id
+      }))
+    })
+
+    return items.slice(0, args.limit)
+  }
+}
 ```
 
-For cookie-auth, add `strategy: cookie` and use `fetch(url, {credentials:'include'})` inside evaluate.
+### B. API Replay (reliable, structured)
 
-### C. Network Intercept
+```js
+export default {
+  site: "hackernews",
+  name: "hot",
+  description: "Hacker News top stories",
+  columns: ["rank", "title", "score", "url"],
+  args: { limit: { type: "int", default: 20 } },
+  health: { min_rows: 5, non_empty: ["title"] },
 
-```yaml
-site: douyin
-name: hot
-domain: douyin.com
-strategy: intercept
-browser: true
-columns: [rank, title, hot]
-pipeline:
-  - intercept:
-      trigger: "navigate: https://www.douyin.com/hot"
-      capture: "/aweme/v1/hot/search/list"
-      timeout: 10
-      select: data.word_list
-  - map:
-      rank: ${{ item.position }}
-      title: ${{ item.word }}
-      hot: ${{ item.hot_value }}
-  - limit: ${{ args.limit }}
+  async run(page, args) {
+    // API doesn't need cookies — fetch directly
+    const ids = await page.fetch("https://hacker-news.firebaseio.com/v0/topstories.json")
+    const items = []
+
+    for (const id of ids.slice(0, args.limit)) {
+      const item = await page.fetch(`https://hacker-news.firebaseio.com/v0/item/${id}.json`)
+      items.push({
+        rank: String(items.length + 1),
+        title: item.title,
+        score: String(item.score),
+        url: item.url || `https://news.ycombinator.com/item?id=${id}`
+      })
+    }
+
+    return items
+  }
+}
 ```
 
-Use intercept when the API uses signed params, CSRF tokens, or encrypted headers that can't be replayed.
+For cookie-auth APIs, `page.nav(domain)` first to establish session, then `page.fetch(apiUrl)`.
 
-### D. Write via Lua
+### C. DOM Extraction (fallback)
 
-```yaml
-site: xiaohongshu
-name: publish
-domain: creator.xiaohongshu.com
-strategy: cookie
-browser: true
-columns: [status, detail]
-args:
-  title: { type: string, default: "" }
-  images: { type: string }
-run: |
-  page:goto("https://creator.xiaohongshu.com/publish/publish")
-  page:wait_for_selector(".creator-tab", 10)
-  page:click_text("Upload")
-  page:wait(2)
-  page:upload("input.upload-input", args.images)
-  page:wait(20)
-  if args.title ~= "" then
-    page:type_into("input.d-text", args.title)
-  end
-  page:click_text("Publish")
-  page:wait(5)
-  return { status = "submitted", detail = page:page_info().url or "" }
+```js
+export default {
+  site: "hackernews",
+  name: "hot",
+  description: "HN top stories",
+  columns: ["rank", "title", "hot"],
+  args: { limit: { type: "int", default: 20 } },
+  health: { min_rows: 5, non_empty: ["title"] },
+
+  async run(page, args) {
+    await page.nav("https://news.ycombinator.com/")
+    await page.waitFor(".athing", 10000)
+    await page.wait(2000)
+
+    const items = await page.eval(() => {
+      return Array.from(document.querySelectorAll('.athing')).map(row => {
+        const title = row.querySelector('.titleline > a')?.textContent || ''
+        const score = row.nextElementSibling?.querySelector('.score')?.textContent?.replace(/\D/g, '') || '0'
+        const rank = row.querySelector('.rank')?.textContent?.replace('.', '').trim() || ''
+        return { rank, title, hot: score }
+      }).filter(item => item.title.length > 0)
+    })
+
+    return items.slice(0, args.limit)
+  }
+}
 ```
 
-Lua API: `page:goto`, `page:wait`, `page:wait_for_selector`, `page:click_text`, `page:click_selector`, `page:type_into`, `page:upload`, `page:find`, `page:page_info`, `page:evaluate`, `page:screenshot`, `page:wait_for_url`. For composition: `claw.run(site, adapter, {args})`.
+### D. Interactive (write/action)
 
-## 4. Pitfalls
+```js
+export default {
+  site: "xiaohongshu",
+  name: "publish",
+  description: "发布小红书笔记",
+  columns: ["status", "url"],
+  args: {
+    title: { type: "string" },
+    images: { type: "string" }  // comma-separated paths
+  },
 
-| Problem | Cause | Fix |
-|---------|-------|-----|
-| Empty data | SPA not loaded when evaluate runs | Add `wait: 2-3` or `wait_for_selector` before evaluate |
-| Click does nothing | React/Vue ignores JS dispatchEvent | Use `click:` or `click_selector:` (CDP native), never JS `.click()` |
-| Stale selectors | Site redesign | Prefer stable selectors: `[data-testid]`, `.rank`, semantic class names. Avoid generated classes like `.css-1a2b3c` |
-| Cookie auth fails | Domain mismatch | Set `domain:` to match cookie scope. `navigate` first to establish cookie context |
-| Upload hangs | Wrong input selector | Target `input[type='file']` directly, even if hidden. `page:upload` uses CDP DOM.setFileInputFiles |
-| Intercept misses | Timing: request fires before listener | `intercept` handles this -- it sets up capture before executing trigger |
-| Template not resolved | Typo in `${{ }}` | Must be exactly `${{ args.name }}` or `${{ item.field }}` with spaces inside braces |
-| Lua returns nothing | Missing `return` | Lua `run:` must end with `return {field=val}` or `return {{row1}, {row2}}` |
-| evaluate returns undefined | Async without await | Wrap in `(async () => { ... })()` for any fetch/Promise code |
-| Modal/popup blocks flow | Overlay appears on load | Use `if page:find(".modal")` (Lua) or `if_selector:` (YAML) to dismiss |
+  async run(page, args) {
+    await page.nav("https://creator.xiaohongshu.com/publish/publish")
+    await page.waitFor(".creator-tab", 10000)
 
-## 5. Quality Checklist
+    await page.upload("input[type='file']", args.images)
+    await page.wait(5000)
 
-- [ ] `columns:` matches keys in `map:` or Lua return
-- [ ] `wait:` or `wait_for_selector:` before any DOM read
-- [ ] `limit:` step present and wired to `${{ args.limit }}`
-- [ ] No hardcoded generated CSS classes (`.css-xxx`, `._abc123`)
-- [ ] evaluate returns an array of objects, not raw HTML
-- [ ] Lua scripts have explicit `return`
-- [ ] `strategy:` matches actual auth requirement
-- [ ] `browser: true` set when pipeline uses navigate/click/evaluate
-- [ ] Version and last_forged metadata present
-- [ ] Tested with `verify_adapter` -- returns rows, no step errors
+    if (args.title) {
+      await page.type("input.d-text", args.title)
+    }
 
-## 6. Transform Helpers
+    await page.click("发布")
+    await page.wait(3000)
 
-Available in `transform:` steps (Lua). Data arrives as `data` (array of objects), `args` as global.
-
-```yaml
-# Sort by field
-- transform: "return sort_by(data, 'views', 'desc')"    # or 'asc' (default)
-
-# Limit results
-- transform: "return limit(data, 10)"
-
-# Keep only specific fields
-- transform: "return pick(data, 'title', 'url')"
-
-# Group into {key, items, count} objects
-- transform: "return group_by(data, 'platform')"
-
-# Deduplicate by field (keeps first occurrence)
-- transform: "return unique_by(data, 'title')"
-
-# Chain: sort then limit
-- transform: "return limit(sort_by(data, 'hot', 'desc'), 20)"
+    const url = await page.eval(() => location.href)
+    return [{ status: "submitted", url }]
+  }
+}
 ```
 
-Helpers: `sort_by(tbl, field, order)`, `limit(tbl, n)`, `pick(tbl, ...)`, `group_by(tbl, field)`, `unique_by(tbl, field)`.
+## 6. Pitfalls
+
+| Problem | Fix |
+|---------|-----|
+| Empty data | Add `page.waitFor(selector)` or `page.wait(2000)` before eval |
+| Click does nothing | Use `page.click()` (CDP native), never JS `.click()` in eval |
+| Stale selectors | Prefer `[data-testid]`, semantic classes. Avoid `.css-1a2b3c` |
+| Cookie auth fails | `page.nav(domain)` first, then `page.fetch(api)` |
+| evaluate returns undefined | Wrap async code: `page.eval(async () => { ... })` |
+| fetch returns HTML | API URL wrong, or needs specific headers/cookies |
+
+## 7. Quality Checklist
+
+- [ ] `columns` matches keys in returned objects
+- [ ] `waitFor` or `wait` before DOM reads
+- [ ] `args.limit` used to cap results
+- [ ] No hardcoded generated CSS classes
+- [ ] `eval` returns array of objects, not raw HTML
+- [ ] `health` contract defined (min_rows, non_empty)
+- [ ] Tested with `forge_verify` — returns rows, correct columns

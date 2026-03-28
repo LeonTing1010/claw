@@ -3,26 +3,20 @@
 //! Exposes claw's forge toolkit as MCP tools over stdin/stdout JSON-RPC.
 //! This lets AI agents (Claude Code, etc.) use claw's scalpels natively.
 
-use std::collections::HashMap;
-
 use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
 use crate::bridge::BridgeServer;
-use crate::browser;
 use crate::cdp::CdpClient;
 
 /// Run the MCP server: read JSON-RPC from stdin, write responses to stdout.
-pub async fn serve(port: u16, headless: bool) -> Result<(), Box<dyn std::error::Error>> {
+pub async fn serve() -> Result<(), Box<dyn std::error::Error>> {
     let stdin = tokio::io::stdin();
     let mut stdout = tokio::io::stdout();
     let mut reader = BufReader::new(stdin);
 
     // Start bridge server immediately — extension can connect anytime
     let bridge = BridgeServer::start();
-
-    // Lazy-init CDP client on first tool call
-    let mut client: Option<CdpClient> = None;
 
     loop {
         let mut line = String::new();
@@ -56,16 +50,38 @@ pub async fn serve(port: u16, headless: bool) -> Result<(), Box<dyn std::error::
             "notifications/initialized" => continue, // no response needed
             "tools/list" => handle_tools_list(&id),
             "tools/call" => {
-                // Ensure CDP client is connected — try extension bridge first
-                if client.is_none() {
-                    if let Some(bridge_client) = bridge.get_client().await {
-                        eprintln!("mcp: using Chrome extension bridge");
-                        client = Some(bridge_client);
-                    } else {
-                        client = Some(browser::connect_browser(port, headless).await?);
+                // Wait for extension bridge — poll up to 30s
+                let client = match bridge.get_client().await {
+                    Some(c) => c,
+                    None => {
+                        eprintln!("mcp: waiting for Chrome extension...");
+                        let mut client_opt = None;
+                        for _ in 0..30 {
+                            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                            if let Some(c) = bridge.get_client().await {
+                                eprintln!("mcp: connected via Chrome extension bridge");
+                                client_opt = Some(c);
+                                break;
+                            }
+                        }
+                        match client_opt {
+                            Some(c) => c,
+                            None => {
+                                let err_resp = json!({
+                                    "jsonrpc": "2.0",
+                                    "id": id,
+                                    "result": {
+                                        "content": [{"type": "text", "text": "error: Chrome extension not connected. Install Claw extension and reload it."}],
+                                        "isError": true
+                                    }
+                                });
+                                write_response(&mut stdout, &err_resp).await?;
+                                continue;
+                            }
+                        }
                     }
-                }
-                handle_tool_call(&id, &request["params"], client.as_ref().unwrap()).await
+                };
+                handle_tool_call(&id, &request["params"], &client).await
             }
             _ => json!({
                 "jsonrpc": "2.0",
@@ -300,6 +316,33 @@ fn tools_schema() -> Value {
             "inputSchema": { "type": "object", "properties": {} }
         },
         {
+            "name": "dismiss_dialog",
+            "description": "Handle a JavaScript dialog (alert/confirm/prompt).",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "accept": { "type": "boolean", "description": "Accept or dismiss", "default": true },
+                    "prompt_text": { "type": "string", "description": "Text for prompt dialogs" }
+                }
+            }
+        },
+        {
+            "name": "force_state",
+            "description": "Force pseudo-state (:hover, :focus) on an element without actually hovering.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "selector": { "type": "string", "description": "CSS selector" },
+                    "states": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "Pseudo-states: hover, focus, active, focus-within"
+                    }
+                },
+                "required": ["selector", "states"]
+            }
+        },
+        {
             "name": "hit_test",
             "description": "What element is at pixel (x, y)?",
             "inputSchema": {
@@ -348,58 +391,6 @@ fn tools_schema() -> Value {
             }
         },
         {
-            "name": "dismiss_dialog",
-            "description": "Handle a JavaScript dialog (alert/confirm/prompt).",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "accept": { "type": "boolean", "description": "Accept or dismiss", "default": true },
-                    "prompt_text": { "type": "string", "description": "Text for prompt dialogs" }
-                }
-            }
-        },
-        {
-            "name": "force_state",
-            "description": "Force pseudo-state (:hover, :focus) on an element without actually hovering.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "selector": { "type": "string", "description": "CSS selector" },
-                    "states": {
-                        "type": "array",
-                        "items": { "type": "string" },
-                        "description": "Pseudo-states: hover, focus, active, focus-within"
-                    }
-                },
-                "required": ["selector", "states"]
-            }
-        },
-        {
-            "name": "verify_adapter",
-            "description": "Verify a claw — dry-run and report per-step health (pass/fail, timing, diagnostics).",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "site": { "type": "string", "description": "Site name" },
-                    "name": { "type": "string", "description": "Adapter name" },
-                    "args": { "type": "object", "description": "Adapter arguments", "additionalProperties": true }
-                },
-                "required": ["site", "name"]
-            }
-        },
-        {
-            "name": "try_step",
-            "description": "Try a single pipeline step and return structured result (status, timing, error). Use during forging to test steps incrementally.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "step": { "type": "string", "description": "Pipeline step as YAML (e.g. 'navigate: https://example.com')" },
-                    "args": { "type": "object", "description": "Template arguments", "additionalProperties": true }
-                },
-                "required": ["step"]
-            }
-        },
-        {
             "name": "download",
             "description": "Download a URL to a local file using the browser session (cookies, referer, auth). Works with auth-gated and anti-hotlink URLs.",
             "inputSchema": {
@@ -424,6 +415,16 @@ fn tools_schema() -> Value {
             }
         },
         {
+            "name": "page_intelligence",
+            "description": "One-shot page analysis for claw forging. Returns framework detection, SSR state (with data samples), API endpoint hints, interactive elements, auth state, and ranked strategy recommendations — all in a single call. Replaces 5-8 separate tool calls (screenshot + ax_tree + global_names + api_log + page_info). Call this FIRST when forging a new claw.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "url": { "type": "string", "description": "Navigate to this URL before analysis (optional — omit to analyze current page)" }
+                }
+            }
+        },
+        {
             "name": "list_adapters",
             "description": "List all available claws. Returns site, name, and description for each. Use this to discover what websites Claw can access.",
             "inputSchema": { "type": "object", "properties": {} }
@@ -437,19 +438,6 @@ fn tools_schema() -> Value {
                     "site": { "type": "string", "description": "Site name (e.g. 'weibo', 'bilibili')" },
                     "name": { "type": "string", "description": "Adapter name (e.g. 'hot', 'trending')" },
                     "args": { "type": "object", "description": "Adapter arguments (e.g. {limit: 10})", "additionalProperties": true }
-                },
-                "required": ["site", "name"]
-            }
-        },
-        {
-            "name": "check_adapter",
-            "description": "Health check a claw — run it and validate output against health/schema contracts. Returns status (Healthy/Degraded/Broken) and per-check results.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "site": { "type": "string", "description": "Site name" },
-                    "name": { "type": "string", "description": "Adapter name" },
-                    "args": { "type": "object", "description": "Adapter arguments", "additionalProperties": true }
                 },
                 "required": ["site", "name"]
             }
@@ -519,6 +507,34 @@ fn tools_schema() -> Value {
                 "properties": {
                     "type": { "type": "string", "description": "Storage type: 'local' (default) or 'session'" }
                 }
+            }
+        },
+        // ===== FORGE — Claw Creation Pipeline =====
+        {
+            "name": "forge_verify",
+            "description": "One-shot test of claw extraction logic. Navigates to URL, waits, evaluates a JS expression in page context, and validates the result shape against expected columns. Combines navigate + wait + evaluate + validate into one call. Use this during forging to iterate quickly on the data extraction logic before saving.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "url": { "type": "string", "description": "URL to navigate to" },
+                    "wait_ms": { "type": "integer", "description": "Milliseconds to wait after navigation (default: 2000)", "default": 2000 },
+                    "expression": { "type": "string", "description": "JS expression that returns an array of objects (the claw's data extraction logic)" },
+                    "columns": { "type": "array", "items": { "type": "string" }, "description": "Expected column names — used to validate the result shape" }
+                },
+                "required": ["url", "expression"]
+            }
+        },
+        {
+            "name": "forge_save",
+            "description": "Save a .claw.js file to disk. Writes to ~/.claw/claws/{site}/{name}.claw.js. Use after verifying the claw works with forge_verify.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "site": { "type": "string", "description": "Site name (e.g. 'weibo')" },
+                    "name": { "type": "string", "description": "Claw name (e.g. 'hot')" },
+                    "code": { "type": "string", "description": "Full .claw.js source code" }
+                },
+                "required": ["site", "name", "code"]
             }
         },
         // ===== INTERCEPT — Active Request Interception =====
@@ -757,68 +773,6 @@ async fn execute_tool(
             client.force_pseudo_state(selector, &states).await?;
             Ok(json!(format!("forced {:?} on {}", states, selector)))
         }
-        "verify_adapter" => {
-            let site = args["site"].as_str().ok_or("missing site")?;
-            let name = args["name"].as_str().ok_or("missing name")?;
-
-            let home = std::env::var("HOME").unwrap_or_default();
-            let dirs = ["adapters".to_string(), format!("{}/.claw/adapters", home)];
-            let refs: Vec<&str> = dirs.iter().map(|s| s.as_str()).collect();
-            let ada = crate::adapter::load_adapter(&refs, site, name)?;
-
-            let mut adapter_args = HashMap::new();
-            if let Some(ref defs) = ada.args {
-                for (key, def) in defs {
-                    if let Some(ref default) = def.default {
-                        adapter_args.insert(key.clone(), default.clone());
-                    }
-                }
-            }
-            // Merge provided args
-            if let Some(obj) = args["args"].as_object() {
-                for (k, v) in obj {
-                    adapter_args.insert(k.clone(), v.clone());
-                }
-            }
-
-            let results =
-                crate::pipeline::execute_with_report(&ada.pipeline, Some(client), adapter_args, 0)
-                    .await;
-            Ok(json!(results))
-        }
-        "try_step" => {
-            let step_yaml = args["step"].as_str().ok_or("missing step")?;
-            let parsed = crate::adapter::parse_single_step(step_yaml)?;
-
-            let mut step_args = HashMap::new();
-            if let Some(obj) = args["args"].as_object() {
-                for (k, v) in obj {
-                    step_args.insert(k.clone(), v.clone());
-                }
-            }
-
-            let label = crate::pipeline::step_label(&parsed);
-            let start = std::time::Instant::now();
-            let mut data = Vec::new();
-            let mut rows = Vec::new();
-            let result = crate::pipeline::execute_single_step(
-                &parsed,
-                Some(client),
-                &step_args,
-                &mut data,
-                &mut rows,
-                0,
-            )
-            .await;
-            let duration_ms = start.elapsed().as_millis();
-
-            Ok(json!({
-                "step": label,
-                "status": if result.is_ok() { "pass" } else { "fail" },
-                "duration_ms": duration_ms,
-                "error": result.err().map(|e| e.to_string())
-            }))
-        }
         "download" => {
             let url = args["url"].as_str().ok_or("missing url")?;
             let output = args["output"].as_str().ok_or("missing output")?;
@@ -829,6 +783,17 @@ async fn execute_tool(
             let selector = args["selector"].as_str().ok_or("missing selector")?;
             let output = args["output"].as_str().ok_or("missing output")?;
             client.save_image(selector, output).await
+        }
+        "page_intelligence" => {
+            // Navigate first if URL provided
+            if let Some(url) = args["url"].as_str() {
+                client.navigate(url).await?;
+            }
+            // Relay to extension — gathers framework, SSR state, APIs, interactive, auth in one call
+            let result = client
+                .send("Claw.pageIntelligence", Some(json!({})))
+                .await?;
+            Ok(result)
         }
         "list_adapters" => {
             let base_dirs = crate::adapter::adapter_base_dirs();
@@ -850,72 +815,111 @@ async fn execute_tool(
         "run_adapter" => {
             let site = args["site"].as_str().ok_or("missing site")?;
             let name = args["name"].as_str().ok_or("missing name")?;
-            let mut adapter_args = HashMap::new();
-            if let Some(obj) = args["args"].as_object() {
-                for (k, v) in obj {
-                    adapter_args.insert(k.clone(), v.clone());
-                }
-            }
-            let (columns, rows) =
-                crate::adapter::run_adapter(Some(client), site, name, adapter_args, 0)
-                    .await
-                    .map_err(|e| -> Box<dyn std::error::Error> { e })?;
-            let json_rows: Vec<Value> = rows
-                .iter()
-                .map(|row| {
-                    let obj: serde_json::Map<String, Value> = row
-                        .iter()
-                        .map(|(k, v)| (k.clone(), Value::String(v.clone())))
-                        .collect();
-                    Value::Object(obj)
-                })
-                .collect();
-            Ok(json!({
-                "columns": columns,
-                "rows": json_rows,
-                "count": json_rows.len()
-            }))
+            let adapter_args = args.get("args").cloned().unwrap_or(json!({}));
+
+            // Relay to Chrome extension via bridge
+            let result = client
+                .send(
+                    "Claw.run",
+                    Some(json!({
+                        "site": site,
+                        "name": name,
+                        "args": adapter_args
+                    })),
+                )
+                .await?;
+            Ok(result)
         }
-        "check_adapter" => {
-            let site = args["site"].as_str().ok_or("missing site")?;
-            let name = args["name"].as_str().ok_or("missing name")?;
+        // ===== FORGE — Claw Creation Pipeline =====
+        "forge_verify" => {
+            let url = args["url"].as_str().ok_or("missing url")?;
+            let wait_ms = args["wait_ms"].as_u64().unwrap_or(2000);
+            let expression = args["expression"].as_str().ok_or("missing expression")?;
+            let columns: Vec<&str> = args["columns"]
+                .as_array()
+                .map(|a| a.iter().filter_map(|v| v.as_str()).collect())
+                .unwrap_or_default();
 
-            let home = std::env::var("HOME").unwrap_or_default();
-            let dirs = ["adapters".to_string(), format!("{}/.claw/adapters", home)];
-            let refs: Vec<&str> = dirs.iter().map(|s| s.as_str()).collect();
-            let ada = crate::adapter::load_adapter(&refs, site, name)?;
+            let start = std::time::Instant::now();
 
-            let mut adapter_args = HashMap::new();
-            if let Some(ref defs) = ada.args {
-                for (key, def) in defs {
-                    if let Some(ref default) = def.default {
-                        adapter_args.insert(key.clone(), default.clone());
+            // Navigate
+            client.navigate(url).await?;
+
+            // Wait
+            if wait_ms > 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(wait_ms)).await;
+            }
+
+            // Evaluate
+            let result = client.evaluate(expression).await?;
+            let duration_ms = start.elapsed().as_millis();
+
+            // Validate
+            let mut diagnostics = Vec::new();
+
+            let rows = result.as_array();
+            let row_count = rows.map(|r| r.len()).unwrap_or(0);
+
+            if rows.is_none() {
+                diagnostics.push("FAIL: expression did not return an array".to_string());
+            } else if row_count == 0 {
+                diagnostics.push("WARN: expression returned empty array".to_string());
+            } else {
+                diagnostics.push(format!("OK: {} rows returned", row_count));
+
+                // Check columns against first row
+                if !columns.is_empty() {
+                    if let Some(first_row) = rows.unwrap().first() {
+                        if let Some(obj) = first_row.as_object() {
+                            let actual_keys: Vec<&str> = obj.keys().map(|k| k.as_str()).collect();
+                            let missing: Vec<&&str> = columns.iter()
+                                .filter(|c| !actual_keys.contains(*c))
+                                .collect();
+                            let extra: Vec<&&str> = actual_keys.iter()
+                                .filter(|k| !columns.contains(*k))
+                                .collect();
+                            if missing.is_empty() {
+                                diagnostics.push(format!("OK: all {} columns present", columns.len()));
+                            } else {
+                                diagnostics.push(format!("FAIL: missing columns: {:?}", missing));
+                            }
+                            if !extra.is_empty() {
+                                diagnostics.push(format!("INFO: extra fields: {:?}", extra));
+                            }
+                        } else {
+                            diagnostics.push("FAIL: first row is not an object".to_string());
+                        }
                     }
                 }
             }
-            if let Some(obj) = args["args"].as_object() {
-                for (k, v) in obj {
-                    adapter_args.insert(k.clone(), v.clone());
-                }
-            }
 
-            match crate::adapter::run_adapter(Some(client), site, name, adapter_args, 0).await {
-                Ok((_cols, rows)) => {
-                    let report = crate::health::validate(&ada, &rows);
-                    Ok(serde_json::to_value(&report)?)
-                }
-                Err(e) => Ok(json!({
-                    "adapter": format!("{}/{}", site, name),
-                    "status": "Broken",
-                    "checks": [{
-                        "name": "execution",
-                        "passed": false,
-                        "message": format!("pipeline error: {}", e)
-                    }]
-                })),
-            }
+            let sample = rows
+                .map(|r| r.iter().take(5).cloned().collect::<Vec<_>>())
+                .unwrap_or_default();
+
+            Ok(json!({
+                "status": if diagnostics.iter().any(|d| d.starts_with("FAIL")) { "fail" } else { "pass" },
+                "row_count": row_count,
+                "duration_ms": duration_ms,
+                "sample": sample,
+                "diagnostics": diagnostics
+            }))
         }
-        // ===== FORGE — Agent's Scalpels =====
+        "forge_save" => {
+            let site = args["site"].as_str().ok_or("missing site")?;
+            let name = args["name"].as_str().ok_or("missing name")?;
+            let code = args["code"].as_str().ok_or("missing code")?;
+
+            let home = std::env::var("HOME").unwrap_or_default();
+            let dir = format!("{}/.claw/claws/{}", home, site);
+            std::fs::create_dir_all(&dir)?;
+
+            let path = format!("{}/{}.claw.js", dir, name);
+            std::fs::write(&path, code)?;
+
+            Ok(json!(format!("saved to {}", path)))
+        }
+        // ===== FORGE — Agent's Scalpels (Deep Inspection) =====
         "api_log" => {
             let clear = args["clear"].as_bool().unwrap_or(false);
             let log = client.get_api_log().await?;
@@ -1013,22 +1017,7 @@ mod tests {
             tools.iter().any(|t| t["name"] == "run_adapter"),
             "MCP tools must include run_adapter"
         );
-        // run_adapter must require site and name
         let tool = tools.iter().find(|t| t["name"] == "run_adapter").unwrap();
-        let required = tool["inputSchema"]["required"].as_array().unwrap();
-        assert!(required.contains(&json!("site")));
-        assert!(required.contains(&json!("name")));
-    }
-
-    #[test]
-    fn tools_schema_includes_check_adapter() {
-        let schema = tools_schema();
-        let tools = schema.as_array().unwrap();
-        assert!(
-            tools.iter().any(|t| t["name"] == "check_adapter"),
-            "MCP tools must include check_adapter"
-        );
-        let tool = tools.iter().find(|t| t["name"] == "check_adapter").unwrap();
         let required = tool["inputSchema"]["required"].as_array().unwrap();
         assert!(required.contains(&json!("site")));
         assert!(required.contains(&json!("name")));
@@ -1054,13 +1043,6 @@ mod tests {
                 tool_name
             );
         }
-        // request_replay must require url
-        let replay = tools
-            .iter()
-            .find(|t| t["name"] == "request_replay")
-            .unwrap();
-        let required = replay["inputSchema"]["required"].as_array().unwrap();
-        assert!(required.contains(&json!("url")));
     }
 
     #[test]
@@ -1083,11 +1065,5 @@ mod tests {
                 tool_name
             );
         }
-        let cont = tools
-            .iter()
-            .find(|t| t["name"] == "intercept_continue")
-            .unwrap();
-        let required = cont["inputSchema"]["required"].as_array().unwrap();
-        assert!(required.contains(&json!("request_id")));
     }
 }
