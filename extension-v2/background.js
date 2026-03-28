@@ -10,7 +10,7 @@
  * and claw protocol (action: "list", action: "run").
  */
 
-import { registerClaw, listClaws, getClaw, runClaw, parseClawURL } from './runtime/executor.js'
+import { registerClaw, listClaws, runClaw, parseClawURL } from './runtime/executor.js'
 import { gatherPageIntelligence } from './runtime/page-intelligence.js'
 
 // --- Claw Registration ---
@@ -182,10 +182,6 @@ async function handleClawCommand(method, params = {}) {
       return await handleClawAction({ action: 'list' })
     }
 
-    case 'Claw.sync': {
-      return await syncClaws()
-    }
-
     default:
       throw new Error(`Unknown Claw command: ${method}`)
   }
@@ -195,20 +191,8 @@ async function handleClawCommand(method, params = {}) {
 
 async function handleClawAction(msg) {
   switch (msg.action) {
-    case 'list': {
-      // Merge bundled claws with synced claws
-      const bundled = listClaws()
-      const stored = (await chrome.storage.local.get('synced_claws'))?.synced_claws || {}
-      const bundledKeys = new Set(bundled.map(c => `${c.site}/${c.name}.claw.js`))
-      const synced = Object.keys(stored)
-        .filter(k => !bundledKeys.has(k))
-        .map(k => {
-          const [site, file] = k.split('/')
-          const name = file.replace('.claw.js', '')
-          return { site, name, description: '(synced)', columns: [] }
-        })
-      return { claws: [...bundled, ...synced] }
-    }
+    case 'list':
+      return { claws: listClaws() }
 
     case 'run': {
       let site, name, args
@@ -227,12 +211,7 @@ async function handleClawAction(msg) {
       }
       if (!tabId) throw new Error('no tab available')
 
-      // Try bundled first, fall back to synced (dynamic sandbox execution)
-      const mod = getClaw(site, name)
-      if (mod) {
-        return await runClaw(site, name, args, tabId)
-      }
-      return await runSyncedClaw(site, name, args, tabId)
+      return await runClaw(site, name, args, tabId)
     }
 
     case 'ping':
@@ -392,216 +371,6 @@ async function ensureDebugger() {
 async function withDebugger(fn) {
   await ensureDebugger()
   return await fn()
-}
-
-// --- Sync: pull .claw.js from GitHub registry ---
-
-const REGISTRY_URL = 'https://api.github.com/repos/LeonTing1010/claw/git/trees/master?recursive=1'
-const RAW_BASE = 'https://raw.githubusercontent.com/LeonTing1010/claw/master/extension-v2/claws'
-
-async function syncClaws() {
-  const resp = await fetch(REGISTRY_URL)
-  const tree = await resp.json()
-  const files = (tree.tree || [])
-    .filter(f => f.type === 'blob' && f.path.startsWith('extension-v2/claws/') && f.path.endsWith('.claw.js'))
-    .map(f => f.path.replace('extension-v2/claws/', ''))
-
-  const stored = (await chrome.storage.local.get('synced_claws'))?.synced_claws || {}
-  let synced = 0, skipped = 0
-
-  for (const file of files) {
-    const url = `${RAW_BASE}/${file}`
-    try {
-      const code = await (await fetch(url)).text()
-      if (stored[file] === code) { skipped++; continue }
-      stored[file] = code
-      synced++
-      console.log(`[claw] synced ${file}`)
-    } catch (e) {
-      console.warn(`[claw] sync failed: ${file}`, e.message)
-    }
-  }
-
-  await chrome.storage.local.set({ synced_claws: stored })
-  console.log(`[claw] sync done: ${synced} updated, ${skipped} unchanged`)
-  return { synced, skipped, total: files.length }
-}
-
-// --- Sandbox Runner: execute dynamically synced claws ---
-
-let sandboxFrame = null
-
-function getSandbox() {
-  if (sandboxFrame) return sandboxFrame
-  sandboxFrame = document.createElement('iframe')
-  sandboxFrame.src = chrome.runtime.getURL('sandbox.html')
-  document.body.appendChild(sandboxFrame)
-  return sandboxFrame
-}
-
-// Pending sandbox runs
-const sandboxRuns = new Map()
-let sandboxRunId = 0
-
-// Handle messages from sandbox iframe
-self.addEventListener('message', async (event) => {
-  const msg = event.data
-  if (!msg?.type) return
-
-  if (msg.type === 'page_call') {
-    // Sandbox wants to call a page.* API
-    const { id, callId, method, args } = msg
-    try {
-      const result = await executeSandboxPageCall(method, args)
-      getSandbox().contentWindow.postMessage({ type: 'page_result', callId, result }, '*')
-    } catch (e) {
-      getSandbox().contentWindow.postMessage({ type: 'page_result', callId, error: e.message }, '*')
-    }
-  }
-
-  if (msg.type === 'result') {
-    const pending = sandboxRuns.get(msg.id)
-    if (pending) {
-      sandboxRuns.delete(msg.id)
-      if (msg.error) pending.reject(new Error(msg.error))
-      else pending.resolve(msg.result)
-    }
-  }
-})
-
-async function executeSandboxPageCall(method, args) {
-  const tabId = activeTabId
-  if (!tabId && method !== 'wait') throw new Error('no active tab')
-
-  switch (method) {
-    case 'nav':
-      await chrome.tabs.update(tabId, { url: args[0] })
-      await waitForTabLoad(tabId)
-      return null
-
-    case 'waitFor': {
-      const [selector, timeout = 10000] = args
-      const start = Date.now()
-      while (Date.now() - start < timeout) {
-        const [r] = await chrome.scripting.executeScript({
-          target: { tabId }, func: s => !!document.querySelector(s), args: [selector], world: 'MAIN'
-        })
-        if (r?.result) return null
-        await new Promise(r => setTimeout(r, 300))
-      }
-      throw new Error(`waitFor: "${selector}" timeout`)
-    }
-
-    case 'eval': {
-      const [fnStr, ...fnArgs] = args
-      // Reconstruct function from string and execute via debugger (bypasses CSP)
-      const expr = `(${fnStr})(${fnArgs.map(a => JSON.stringify(a)).join(',')})`
-      return await withDebugger(async () => {
-        const r = await chrome.debugger.sendCommand({ tabId }, 'Runtime.evaluate', {
-          expression: expr, returnByValue: true, awaitPromise: true
-        })
-        if (r.exceptionDetails) throw new Error(r.exceptionDetails.text || 'eval error')
-        return r.result?.value
-      })
-    }
-
-    case 'fetch': {
-      const [url, opts = {}] = args
-      const [r] = await chrome.scripting.executeScript({
-        target: { tabId },
-        func: async (u, o) => { const r = await fetch(u, { credentials: 'include', ...o }); return r.json() },
-        args: [url, opts], world: 'MAIN'
-      })
-      return r?.result
-    }
-
-    case 'click': {
-      const [target] = args
-      const [r] = await chrome.scripting.executeScript({
-        target: { tabId },
-        func: t => {
-          let el = document.querySelector(t)
-          if (!el) {
-            const w = document.createTreeWalker(document.body, NodeFilter.SHOW_ELEMENT)
-            while (w.nextNode()) {
-              if (w.currentNode.textContent?.trim() === t && w.currentNode.offsetParent !== null) { el = w.currentNode; break }
-            }
-          }
-          if (!el) return null
-          const rect = el.getBoundingClientRect()
-          return { x: rect.x + rect.width / 2, y: rect.y + rect.height / 2 }
-        },
-        args: [target], world: 'MAIN'
-      })
-      if (!r?.result) throw new Error(`click: "${target}" not found`)
-      await withDebugger(async () => {
-        const p = { x: r.result.x, y: r.result.y, button: 'left', clickCount: 1 }
-        await chrome.debugger.sendCommand({ tabId }, 'Input.dispatchMouseEvent', { type: 'mousePressed', ...p })
-        await chrome.debugger.sendCommand({ tabId }, 'Input.dispatchMouseEvent', { type: 'mouseReleased', ...p })
-      })
-      return null
-    }
-
-    case 'type': {
-      const [selector, text] = args
-      await chrome.scripting.executeScript({
-        target: { tabId }, func: s => { const el = document.querySelector(s); if (el) { el.focus(); el.click() } },
-        args: [selector], world: 'MAIN'
-      })
-      await new Promise(r => setTimeout(r, 100))
-      await withDebugger(async () => {
-        for (const c of text) {
-          await chrome.debugger.sendCommand({ tabId }, 'Input.dispatchKeyEvent', { type: 'keyDown', text: c, key: c })
-          await chrome.debugger.sendCommand({ tabId }, 'Input.dispatchKeyEvent', { type: 'keyUp', key: c })
-        }
-      })
-      return null
-    }
-
-    case 'screenshot':
-      return await chrome.tabs.captureVisibleTab(null, { format: 'png' })
-
-    case 'cookies': {
-      const tab = await chrome.tabs.get(tabId)
-      return await chrome.cookies.getAll({ url: tab.url })
-    }
-
-    case 'claw': {
-      const [site, name, clawArgs = {}] = args
-      const result = await handleClawAction({ action: 'run', site, name, args: clawArgs })
-      return result?.rows || result
-    }
-
-    default:
-      throw new Error(`sandbox: unknown page method "${method}"`)
-  }
-}
-
-async function runSyncedClaw(site, name, args, tabId) {
-  const key = `${site}/${name}.claw.js`
-  const stored = (await chrome.storage.local.get('synced_claws'))?.synced_claws || {}
-  const code = stored[key]
-  if (!code) throw new Error(`claw not found: ${site}/${name} (not bundled or synced)`)
-
-  activeTabId = tabId
-  const id = ++sandboxRunId
-  const sandbox = getSandbox()
-
-  return new Promise((resolve, reject) => {
-    sandboxRuns.set(id, { resolve, reject })
-    // Wait for sandbox iframe to load, then send
-    const send = () => sandbox.contentWindow.postMessage({ type: 'run', id, code, args }, '*')
-    if (sandbox.contentDocument?.readyState === 'complete') send()
-    else sandbox.addEventListener('load', send, { once: true })
-
-    // Timeout
-    setTimeout(() => {
-      if (sandboxRuns.has(id)) {
-        sandboxRuns.delete(id)
-        reject(new Error('sandbox execution timeout (60s)'))
-      }
-    }, 60000)
-  })
 }
 
 // --- Omnibox: claw:// protocol via address bar ---
