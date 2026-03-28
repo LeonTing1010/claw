@@ -13,7 +13,7 @@ args:
     type: string
   index:
     type: int
-    default: 0
+    default: 1
 
 columns: [type, content, likes, author]
 
@@ -25,15 +25,8 @@ pipeline:
       timeout: "10"
   - wait: 2
 
-  # Step 2: 点击帖子打开弹窗
-  - evaluate: |
-      (() => {
-        const notes = document.querySelectorAll('section.note-item a');
-        const idx = ${{ args.index }};
-        const el = notes[idx] || notes[0];
-        if (el) { el.click(); return []; }
-        return [];
-      })()
+  # Step 2: CDP 原生点击帖子打开弹窗（不能用 JS click，会被反爬拦截）
+  - click_selector: "section.note-item:nth-child(${{ args.index }}) a.cover"
 
   # Step 3: 等待弹窗加载评论数据到 SSR state
   - wait: 5

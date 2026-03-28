@@ -15,24 +15,14 @@ columns: [rank, title, hot]
 pipeline:
   - navigate: https://www.xiaohongshu.com/explore
   - wait: 4
+  # CDP native click to reveal trending searches
+  - click_selector: "input[placeholder*='搜索'], #search-input, .search-input"
+  - wait: 2
   - evaluate: |
       (() => {
-        // Try to get trending/hot topics from the explore page
-        // Xiaohongshu renders trending topics in search suggestions or explore feed
         const items = [];
 
-        // Method 1: Click search to reveal trending searches
-        const searchInput = document.querySelector('input[placeholder*="搜索"], #search-input, .search-input');
-        if (searchInput) {
-          searchInput.focus();
-          searchInput.click();
-        }
-
-        // Wait a moment for suggestions to appear (sync approach)
-        const start = Date.now();
-        while (Date.now() - start < 1500) {} // busy wait for trending to load
-
-        // Method 2: Grab trending/hot items from search suggestions
+        // Grab trending/hot items from search suggestions
         const suggestions = document.querySelectorAll('.trending-item, .hot-item, [class*="hot"] a, [class*="trend"] a, .search-trending-item');
         suggestions.forEach((el, i) => {
           const text = (el.textContent || '').trim();
@@ -41,7 +31,7 @@ pipeline:
           }
         });
 
-        // Method 3: Fallback — extract from explore feed note titles
+        // Fallback — extract from explore feed note titles
         if (items.length === 0) {
           const notes = document.querySelectorAll('.note-item a, [class*="note"] .title, .feeds-page .title, a.title, span.title');
           notes.forEach((el, i) => {

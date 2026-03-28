@@ -8,6 +8,7 @@ use std::collections::HashMap;
 use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
+use crate::bridge::BridgeServer;
 use crate::browser;
 use crate::cdp::CdpClient;
 
@@ -16,6 +17,9 @@ pub async fn serve(port: u16, headless: bool) -> Result<(), Box<dyn std::error::
     let stdin = tokio::io::stdin();
     let mut stdout = tokio::io::stdout();
     let mut reader = BufReader::new(stdin);
+
+    // Start bridge server immediately — extension can connect anytime
+    let bridge = BridgeServer::start();
 
     // Lazy-init CDP client on first tool call
     let mut client: Option<CdpClient> = None;
@@ -52,9 +56,14 @@ pub async fn serve(port: u16, headless: bool) -> Result<(), Box<dyn std::error::
             "notifications/initialized" => continue, // no response needed
             "tools/list" => handle_tools_list(&id),
             "tools/call" => {
-                // Ensure CDP client is connected
+                // Ensure CDP client is connected — try extension bridge first
                 if client.is_none() {
-                    client = Some(browser::connect_browser(port, headless).await?);
+                    if let Some(bridge_client) = bridge.get_client().await {
+                        eprintln!("mcp: using Chrome extension bridge");
+                        client = Some(bridge_client);
+                    } else {
+                        client = Some(browser::connect_browser(port, headless).await?);
+                    }
                 }
                 handle_tool_call(&id, &request["params"], client.as_ref().unwrap()).await
             }
@@ -445,6 +454,147 @@ fn tools_schema() -> Value {
                 "required": ["site", "name"]
             }
         },
+        // ===== FORGE — Agent's Scalpels (Deep Inspection) =====
+        {
+            "name": "api_log",
+            "description": "Get all API calls (fetch/XHR) recorded since page load. Returns url, method, status, request_body, response_body for each call. This captures everything the page does — no manual network_log needed.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "clear": { "type": "boolean", "description": "Clear the log after reading (default: false)" }
+                }
+            }
+        },
+        {
+            "name": "global_names",
+            "description": "List all interesting global variables on the page. Discovers __INITIAL_STATE__, __NEXT_DATA__, __NUXT__, __pinia, Redux stores, and other framework/SSR state. One call reveals what data the page already has.",
+            "inputSchema": { "type": "object", "properties": {} }
+        },
+        {
+            "name": "resource_tree",
+            "description": "List all resources (scripts, stylesheets, images) loaded by the page. Use with resource_content and search_resource to find API endpoints in source code.",
+            "inputSchema": { "type": "object", "properties": {} }
+        },
+        {
+            "name": "resource_content",
+            "description": "Get the source content of a loaded resource (JavaScript file, HTML, etc). Use after resource_tree to read specific scripts.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "url": { "type": "string", "description": "URL of the resource to read" }
+                },
+                "required": ["url"]
+            }
+        },
+        {
+            "name": "search_resource",
+            "description": "Search within all loaded JavaScript/HTML resources for a pattern (e.g. '/api/', 'fetch(', 'axios'). Finds API endpoints directly from source code without triggering UI.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "query": { "type": "string", "description": "Search pattern (plain text)" }
+                },
+                "required": ["query"]
+            }
+        },
+        {
+            "name": "request_replay",
+            "description": "Replay an API request within the page context — uses the page's cookies, origin, and session. Zero anti-crawl detection risk. Use after seeing an API in api_log to test with different parameters.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "url": { "type": "string", "description": "URL to fetch" },
+                    "method": { "type": "string", "description": "HTTP method (default: GET)" },
+                    "headers": { "type": "object", "description": "Extra headers to send" },
+                    "body": { "type": "string", "description": "Request body (for POST/PUT)" }
+                },
+                "required": ["url"]
+            }
+        },
+        {
+            "name": "storage_items",
+            "description": "Read localStorage or sessionStorage. Many SPAs store auth tokens, API keys, and user data here.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "type": { "type": "string", "description": "Storage type: 'local' (default) or 'session'" }
+                }
+            }
+        },
+        // ===== INTERCEPT — Active Request Interception =====
+        {
+            "name": "intercept_on",
+            "description": "Start intercepting requests matching a URL pattern. Paused requests appear in intercept_list. Use intercept_continue/fulfill/fail to handle them. TLS fingerprint unchanged — zero detection risk.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "url_pattern": { "type": "string", "description": "URL pattern to match (e.g. '*api/search*', '*douyin.com/aweme*')" }
+                },
+                "required": ["url_pattern"]
+            }
+        },
+        {
+            "name": "intercept_off",
+            "description": "Stop intercepting requests and release all paused requests.",
+            "inputSchema": { "type": "object", "properties": {} }
+        },
+        {
+            "name": "intercept_list",
+            "description": "List all paused (intercepted) requests — shows requestId, url, method, headers, postData for each. Use requestId with intercept_continue/fulfill/fail.",
+            "inputSchema": { "type": "object", "properties": {} }
+        },
+        {
+            "name": "intercept_continue",
+            "description": "Continue a paused request (optionally modify URL, headers, or POST body before sending to server).",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "request_id": { "type": "string", "description": "Request ID from intercept_list" },
+                    "url": { "type": "string", "description": "Override URL" },
+                    "headers": { "type": "object", "description": "Override headers" },
+                    "post_data": { "type": "string", "description": "Override POST body" }
+                },
+                "required": ["request_id"]
+            }
+        },
+        {
+            "name": "intercept_fulfill",
+            "description": "Fulfill a paused request with a custom response (bypass server entirely). Useful for testing or mocking.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "request_id": { "type": "string", "description": "Request ID from intercept_list" },
+                    "status": { "type": "number", "description": "HTTP status code (default: 200)" },
+                    "body": { "type": "string", "description": "Response body" }
+                },
+                "required": ["request_id", "body"]
+            }
+        },
+        {
+            "name": "intercept_fail",
+            "description": "Block a paused request (prevent it from reaching the server).",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "request_id": { "type": "string", "description": "Request ID from intercept_list" }
+                },
+                "required": ["request_id"]
+            }
+        },
+        {
+            "name": "set_cookie",
+            "description": "Set a cookie on a domain. Use for precise auth control.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "name": { "type": "string" },
+                    "value": { "type": "string" },
+                    "domain": { "type": "string" },
+                    "path": { "type": "string", "description": "Cookie path (default: /)" }
+                },
+                "required": ["name", "value", "domain"]
+            }
+        },
     ])
 }
 
@@ -765,6 +915,78 @@ async fn execute_tool(
                 })),
             }
         }
+        // ===== FORGE — Agent's Scalpels =====
+        "api_log" => {
+            let clear = args["clear"].as_bool().unwrap_or(false);
+            let log = client.get_api_log().await?;
+            if clear {
+                client.clear_api_log().await?;
+            }
+            Ok(log)
+        }
+        "global_names" => client.get_global_names().await,
+        "resource_tree" => client.get_resource_tree().await,
+        "resource_content" => {
+            let url = args["url"].as_str().ok_or("missing url")?;
+            client.get_resource_content(url).await
+        }
+        "search_resource" => {
+            let query = args["query"].as_str().ok_or("missing query")?;
+            client.search_resources(query).await
+        }
+        "request_replay" => {
+            let url = args["url"].as_str().ok_or("missing url")?;
+            let method = args["method"].as_str().unwrap_or("GET");
+            let headers = args.get("headers").filter(|v| !v.is_null());
+            let body = args["body"].as_str();
+            client.request_replay(url, method, headers, body).await
+        }
+        "storage_items" => {
+            let storage_type = args["type"].as_str().unwrap_or("local");
+            client.get_storage_items(storage_type).await
+        }
+        // ===== INTERCEPT — Active Request Interception =====
+        "intercept_on" => {
+            let pattern = args["url_pattern"].as_str().ok_or("missing url_pattern")?;
+            client.fetch_enable(pattern).await?;
+            Ok(json!(format!(
+                "intercepting requests matching '{}'",
+                pattern
+            )))
+        }
+        "intercept_off" => {
+            client.fetch_disable().await?;
+            Ok(json!("interception stopped"))
+        }
+        "intercept_list" => client.get_paused_requests().await,
+        "intercept_continue" => {
+            let id = args["request_id"].as_str().ok_or("missing request_id")?;
+            let url = args["url"].as_str();
+            let headers = args.get("headers").filter(|v| !v.is_null());
+            let post_data = args["post_data"].as_str();
+            client.fetch_continue(id, url, headers, post_data).await?;
+            Ok(json!("request continued"))
+        }
+        "intercept_fulfill" => {
+            let id = args["request_id"].as_str().ok_or("missing request_id")?;
+            let status = args["status"].as_u64().unwrap_or(200) as u16;
+            let body = args["body"].as_str().ok_or("missing body")?;
+            client.fetch_fulfill(id, status, body).await?;
+            Ok(json!("request fulfilled"))
+        }
+        "intercept_fail" => {
+            let id = args["request_id"].as_str().ok_or("missing request_id")?;
+            client.fetch_fail(id).await?;
+            Ok(json!("request blocked"))
+        }
+        "set_cookie" => {
+            let name = args["name"].as_str().ok_or("missing name")?;
+            let value = args["value"].as_str().ok_or("missing value")?;
+            let domain = args["domain"].as_str().ok_or("missing domain")?;
+            let path = args["path"].as_str();
+            client.set_cookie(name, value, domain, path).await?;
+            Ok(json!(format!("cookie '{}' set on {}", name, domain)))
+        }
         _ => Err(format!("unknown tool: {}", name).into()),
     }
 }
@@ -810,5 +1032,62 @@ mod tests {
         let required = tool["inputSchema"]["required"].as_array().unwrap();
         assert!(required.contains(&json!("site")));
         assert!(required.contains(&json!("name")));
+    }
+
+    #[test]
+    fn tools_schema_includes_forge_scalpels() {
+        let schema = tools_schema();
+        let tools = schema.as_array().unwrap();
+        let forge_tools = [
+            "api_log",
+            "global_names",
+            "resource_tree",
+            "resource_content",
+            "search_resource",
+            "request_replay",
+            "storage_items",
+        ];
+        for tool_name in &forge_tools {
+            assert!(
+                tools.iter().any(|t| t["name"] == *tool_name),
+                "MCP tools must include {}",
+                tool_name
+            );
+        }
+        // request_replay must require url
+        let replay = tools
+            .iter()
+            .find(|t| t["name"] == "request_replay")
+            .unwrap();
+        let required = replay["inputSchema"]["required"].as_array().unwrap();
+        assert!(required.contains(&json!("url")));
+    }
+
+    #[test]
+    fn tools_schema_includes_intercept_tools() {
+        let schema = tools_schema();
+        let tools = schema.as_array().unwrap();
+        let intercept_tools = [
+            "intercept_on",
+            "intercept_off",
+            "intercept_list",
+            "intercept_continue",
+            "intercept_fulfill",
+            "intercept_fail",
+            "set_cookie",
+        ];
+        for tool_name in &intercept_tools {
+            assert!(
+                tools.iter().any(|t| t["name"] == *tool_name),
+                "MCP tools must include {}",
+                tool_name
+            );
+        }
+        let cont = tools
+            .iter()
+            .find(|t| t["name"] == "intercept_continue")
+            .unwrap();
+        let required = cont["inputSchema"]["required"].as_array().unwrap();
+        assert!(required.contains(&json!("request_id")));
     }
 }

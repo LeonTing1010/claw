@@ -148,6 +148,73 @@ if (typeof Notification !== 'undefined' && Notification.permission === 'denied')
 })();
 "#;
 
+/// JavaScript hook injected via Page.addScriptToEvaluateOnNewDocument.
+/// Hooks fetch() and XMLHttpRequest to record all API calls with full request+response.
+/// Runs before any page JS — captures everything the page does.
+const API_HOOK_JS: &str = r#"
+(function() {
+    window.__CLAW_API_LOG__ = [];
+    const MAX_BODY = 2000;
+
+    // Hook fetch
+    const _fetch = window.fetch;
+    window.fetch = async function(...args) {
+        const req = new Request(...args);
+        const url = req.url;
+        const method = req.method;
+        let reqBody = null;
+        try { reqBody = await req.clone().text(); } catch(e) {}
+        const resp = await _fetch.apply(this, args);
+        const clone = resp.clone();
+        let respBody = null;
+        try {
+            const ct = resp.headers.get('content-type') || '';
+            if (ct.includes('json') || ct.includes('text') || ct.includes('javascript')) {
+                const t = await clone.text();
+                respBody = t.slice(0, MAX_BODY);
+            }
+        } catch(e) {}
+        if (respBody !== null) {
+            window.__CLAW_API_LOG__.push({
+                url, method, status: resp.status,
+                request_body: reqBody ? reqBody.slice(0, MAX_BODY) : null,
+                response_body: respBody,
+                timestamp: Date.now()
+            });
+        }
+        return resp;
+    };
+
+    // Hook XMLHttpRequest
+    const _open = XMLHttpRequest.prototype.open;
+    const _send = XMLHttpRequest.prototype.send;
+    XMLHttpRequest.prototype.open = function(method, url) {
+        this.__claw_method = method;
+        this.__claw_url = url;
+        return _open.apply(this, arguments);
+    };
+    XMLHttpRequest.prototype.send = function(body) {
+        this.__claw_body = body;
+        this.addEventListener('load', function() {
+            try {
+                const ct = this.getResponseHeader('content-type') || '';
+                if (ct.includes('json') || ct.includes('text')) {
+                    window.__CLAW_API_LOG__.push({
+                        url: this.__claw_url,
+                        method: this.__claw_method || 'GET',
+                        status: this.status,
+                        request_body: this.__claw_body ? String(this.__claw_body).slice(0, MAX_BODY) : null,
+                        response_body: this.responseText.slice(0, MAX_BODY),
+                        timestamp: Date.now()
+                    });
+                }
+            } catch(e) {}
+        });
+        return _send.apply(this, arguments);
+    };
+})();
+"#;
+
 /// CDP JSON-RPC request
 #[derive(Debug, Serialize)]
 pub struct CdpRequest {
@@ -323,6 +390,8 @@ pub struct CdpClient {
     pending_requests: PendingRequests,
     /// Whether network capture is active
     network_capture_active: Arc<Mutex<bool>>,
+    /// Fetch.requestPaused events buffer (active request interception)
+    paused_fetch: Arc<Mutex<Vec<Value>>>,
 }
 
 /// Build Input.dispatchMouseEvent params
@@ -376,6 +445,7 @@ impl CdpClient {
         let network_log: NetworkLog = Arc::new(Mutex::new(Vec::new()));
         let pending_requests: PendingRequests = Arc::new(Mutex::new(HashMap::new()));
         let network_capture_active: Arc<Mutex<bool>> = Arc::new(Mutex::new(false));
+        let paused_fetch: Arc<Mutex<Vec<Value>>> = Arc::new(Mutex::new(Vec::new()));
         let (tx, mut rx) = mpsc::channel::<Message>(64);
 
         // Writer task: forward messages from channel to WebSocket
@@ -393,6 +463,7 @@ impl CdpClient {
         let net_log_clone = network_log.clone();
         let pending_req_clone = pending_requests.clone();
         let net_active_clone = network_capture_active.clone();
+        let paused_fetch_clone = paused_fetch.clone();
         tokio::spawn(async move {
             Self::read_loop(
                 read,
@@ -400,6 +471,7 @@ impl CdpClient {
                 net_log_clone,
                 pending_req_clone,
                 net_active_clone,
+                paused_fetch_clone,
             )
             .await;
         });
@@ -411,6 +483,7 @@ impl CdpClient {
             network_log,
             pending_requests,
             network_capture_active,
+            paused_fetch,
         };
         client.ensure_stealth().await?;
         Ok(client)
@@ -431,6 +504,7 @@ impl CdpClient {
         let network_log: NetworkLog = Arc::new(Mutex::new(Vec::new()));
         let pending_requests: PendingRequests = Arc::new(Mutex::new(HashMap::new()));
         let network_capture_active: Arc<Mutex<bool>> = Arc::new(Mutex::new(false));
+        let paused_fetch: Arc<Mutex<Vec<Value>>> = Arc::new(Mutex::new(Vec::new()));
         let (tx, mut rx) = mpsc::channel::<Message>(64);
 
         let mut write = write;
@@ -446,6 +520,7 @@ impl CdpClient {
         let net_log_clone = network_log.clone();
         let pending_req_clone = pending_requests.clone();
         let net_active_clone = network_capture_active.clone();
+        let paused_fetch_clone = paused_fetch.clone();
         tokio::spawn(async move {
             Self::read_loop(
                 read,
@@ -453,6 +528,7 @@ impl CdpClient {
                 net_log_clone,
                 pending_req_clone,
                 net_active_clone,
+                paused_fetch_clone,
             )
             .await;
         });
@@ -464,6 +540,7 @@ impl CdpClient {
             network_log,
             pending_requests,
             network_capture_active,
+            paused_fetch,
         };
         if stealth {
             client.ensure_stealth().await?;
@@ -490,6 +567,12 @@ impl CdpClient {
             Some(serde_json::json!({ "source": STEALTH_JS })),
         )
         .await?;
+        // Inject API hooks (fetch/XHR recording) alongside stealth
+        self.send(
+            "Page.addScriptToEvaluateOnNewDocument",
+            Some(serde_json::json!({ "source": API_HOOK_JS })),
+        )
+        .await?;
         Ok(())
     }
 
@@ -499,6 +582,7 @@ impl CdpClient {
         network_log: NetworkLog,
         pending_requests: PendingRequests,
         network_capture_active: Arc<Mutex<bool>>,
+        paused_fetch: Arc<Mutex<Vec<Value>>>,
     ) {
         while let Some(Ok(msg)) = read.next().await {
             let Message::Text(text) = msg else {
@@ -513,9 +597,16 @@ impl CdpClient {
             // Handle CDP events (no id)
             if resp.id.is_none() {
                 if let Some(method) = &resp.method {
+                    let params = resp.params.as_ref().cloned().unwrap_or(Value::Null);
+
+                    // Fetch.requestPaused — always capture, regardless of network_capture_active
+                    if method == "Fetch.requestPaused" {
+                        paused_fetch.lock().await.push(params.clone());
+                        continue;
+                    }
+
                     let active = *network_capture_active.lock().await;
                     if active {
-                        let params = resp.params.as_ref().cloned().unwrap_or(Value::Null);
                         match method.as_str() {
                             "Network.requestWillBeSent" => {
                                 let request_id =
@@ -1344,6 +1435,369 @@ impl CdpClient {
         }
 
         Ok(serde_json::to_value(&enriched)?)
+    }
+
+    // ================================================================
+    // FORGE — Agent's Scalpels (Deep Inspection)
+    // ================================================================
+
+    /// Get all API calls recorded by the injected fetch/XHR hooks.
+    /// Returns array of {url, method, status, request_body, response_body, timestamp}.
+    pub async fn get_api_log(&self) -> Result<Value, Box<dyn std::error::Error>> {
+        self.evaluate("window.__CLAW_API_LOG__ || []").await
+    }
+
+    /// Clear the API call log.
+    pub async fn clear_api_log(&self) -> Result<Value, Box<dyn std::error::Error>> {
+        self.evaluate("(window.__CLAW_API_LOG__ = [], 'cleared')")
+            .await
+    }
+
+    /// List all global variable names on the page.
+    /// Discovers __INITIAL_STATE__, __NEXT_DATA__, __NUXT__, etc.
+    pub async fn get_global_names(&self) -> Result<Value, Box<dyn std::error::Error>> {
+        // Runtime.globalLexicalScopeNames only returns let/const at top level.
+        // For window properties (which is what we need), use evaluate.
+        self.evaluate(
+            r#"(() => {
+                const builtins = new Set(['location','chrome','onerror','onmessage','crypto','caches','cookieStore','onbeforeinput']);
+                const interesting = Object.keys(window).filter(k => {
+                    if (builtins.has(k)) return false;
+                    if (k.startsWith('on')) return false;
+                    if (k.startsWith('webkit')) return false;
+                    const v = window[k];
+                    if (typeof v === 'function') return false;
+                    if (v === window || v === document || v === navigator) return false;
+                    return true;
+                });
+                // Also check common SSR/framework globals
+                const ssrKeys = ['__INITIAL_STATE__','__NEXT_DATA__','__NUXT__','__REMIX_CONTEXT__','__APP_DATA__','__VUE__','__REACT_DEVTOOLS_GLOBAL_HOOK__','__pinia','__VUEX__'];
+                const found = {};
+                for (const k of ssrKeys) {
+                    if (window[k] !== undefined) {
+                        const v = window[k];
+                        const t = typeof v;
+                        found[k] = t === 'object' ? { type: t, keys: Object.keys(v).slice(0, 20), size: JSON.stringify(v).length } : { type: t };
+                    }
+                }
+                return { globals: interesting.slice(0, 100), framework_globals: found };
+            })()"#,
+        )
+        .await
+    }
+
+    /// List all resources (scripts, stylesheets, images) loaded by the page.
+    pub async fn get_resource_tree(&self) -> Result<Value, Box<dyn std::error::Error>> {
+        let result = self.send("Page.getResourceTree", None).await?;
+        // Extract just the resources array, not the full frame tree
+        let resources = result
+            .get("frameTree")
+            .and_then(|ft| ft.get("resources"))
+            .cloned()
+            .unwrap_or(Value::Array(vec![]));
+        Ok(resources)
+    }
+
+    /// Get the source content of a loaded resource (script, stylesheet, etc).
+    pub async fn get_resource_content(
+        &self,
+        url: &str,
+    ) -> Result<Value, Box<dyn std::error::Error>> {
+        // Need frame ID from resource tree
+        let tree = self.send("Page.getResourceTree", None).await?;
+        let frame_id = tree
+            .get("frameTree")
+            .and_then(|ft| ft.get("frame"))
+            .and_then(|f| f.get("id"))
+            .and_then(|id| id.as_str())
+            .ok_or("could not determine frame ID")?
+            .to_string();
+
+        let result = self
+            .send(
+                "Page.getResourceContent",
+                Some(serde_json::json!({
+                    "frameId": frame_id,
+                    "url": url
+                })),
+            )
+            .await?;
+        let content = result.get("content").cloned().unwrap_or(Value::Null);
+        let base64_encoded = result
+            .get("base64Encoded")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        Ok(serde_json::json!({
+            "content": content,
+            "base64_encoded": base64_encoded
+        }))
+    }
+
+    /// Search within all loaded JavaScript resources for a pattern.
+    /// Returns matching lines from all scripts.
+    pub async fn search_resources(&self, query: &str) -> Result<Value, Box<dyn std::error::Error>> {
+        // Get all JS resources
+        let tree = self.send("Page.getResourceTree", None).await?;
+        let frame_id = tree
+            .get("frameTree")
+            .and_then(|ft| ft.get("frame"))
+            .and_then(|f| f.get("id"))
+            .and_then(|id| id.as_str())
+            .ok_or("could not determine frame ID")?
+            .to_string();
+
+        let resources = tree
+            .get("frameTree")
+            .and_then(|ft| ft.get("resources"))
+            .and_then(|r| r.as_array())
+            .cloned()
+            .unwrap_or_default();
+
+        let mut matches = Vec::new();
+        for resource in &resources {
+            let rtype = resource["type"].as_str().unwrap_or("");
+            if rtype != "Script" && rtype != "Document" {
+                continue;
+            }
+            let url = resource["url"].as_str().unwrap_or("");
+            if url.is_empty() {
+                continue;
+            }
+
+            // Search in this resource
+            let search_result = self
+                .send(
+                    "Page.searchInResource",
+                    Some(serde_json::json!({
+                        "frameId": frame_id,
+                        "url": url,
+                        "query": query
+                    })),
+                )
+                .await;
+            if let Ok(result) = search_result {
+                if let Some(search_matches) = result.get("result").and_then(|r| r.as_array()) {
+                    if !search_matches.is_empty() {
+                        matches.push(serde_json::json!({
+                            "url": url,
+                            "matches": search_matches.iter().take(10).collect::<Vec<_>>()
+                        }));
+                    }
+                }
+            }
+        }
+        Ok(Value::Array(matches))
+    }
+
+    /// Read localStorage or sessionStorage.
+    pub async fn get_storage_items(
+        &self,
+        storage_type: &str,
+    ) -> Result<Value, Box<dyn std::error::Error>> {
+        let storage = if storage_type == "session" {
+            "sessionStorage"
+        } else {
+            "localStorage"
+        };
+        self.evaluate(&format!(
+            r#"(() => {{
+                const s = {};
+                const items = {{}};
+                for (let i = 0; i < s.length; i++) {{
+                    const k = s.key(i);
+                    items[k] = s.getItem(k).slice(0, 500);
+                }}
+                return items;
+            }})()"#,
+            storage
+        ))
+        .await
+    }
+
+    /// Replay a request within the page context (using page's cookies/session).
+    pub async fn request_replay(
+        &self,
+        url: &str,
+        method: &str,
+        headers: Option<&Value>,
+        body: Option<&str>,
+    ) -> Result<Value, Box<dyn std::error::Error>> {
+        let headers_js = headers
+            .map(|h| serde_json::to_string(h).unwrap_or_default())
+            .unwrap_or_else(|| "{}".to_string());
+        let body_js = match body {
+            Some(b) => format!("{}", crate::cdp::js_str(b)),
+            None => "null".to_string(),
+        };
+        self.evaluate(&format!(
+            r#"(async () => {{
+                const resp = await fetch({url}, {{
+                    method: {method},
+                    credentials: 'include',
+                    headers: {headers},
+                    body: {body}
+                }});
+                const ct = resp.headers.get('content-type') || '';
+                const status = resp.status;
+                const respHeaders = Object.fromEntries(resp.headers.entries());
+                let data;
+                if (ct.includes('json')) {{
+                    data = await resp.json();
+                }} else {{
+                    const t = await resp.text();
+                    data = t.slice(0, 5000);
+                }}
+                return {{ status, headers: respHeaders, data }};
+            }})()"#,
+            url = crate::cdp::js_str(url),
+            method = crate::cdp::js_str(method),
+            headers = headers_js,
+            body = body_js,
+        ))
+        .await
+    }
+
+    // ================================================================
+    // INTERCEPT — Fetch Domain (Active Request Interception)
+    // ================================================================
+
+    /// Start intercepting requests matching a URL pattern.
+    /// Intercepted requests are paused — use get_paused_requests() to see them,
+    /// then fetch_continue/fetch_fulfill/fetch_fail to handle them.
+    pub async fn fetch_enable(&self, url_pattern: &str) -> Result<(), Box<dyn std::error::Error>> {
+        self.send(
+            "Fetch.enable",
+            Some(serde_json::json!({
+                "patterns": [{"urlPattern": url_pattern}]
+            })),
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// Stop intercepting requests.
+    pub async fn fetch_disable(&self) -> Result<(), Box<dyn std::error::Error>> {
+        self.send("Fetch.disable", None).await?;
+        // Drain buffer
+        self.paused_fetch.lock().await.clear();
+        Ok(())
+    }
+
+    /// Get all paused requests (from Fetch.requestPaused events) and clear the buffer.
+    pub async fn get_paused_requests(&self) -> Result<Value, Box<dyn std::error::Error>> {
+        let requests: Vec<Value> = self.paused_fetch.lock().await.drain(..).collect();
+        // Extract useful fields for each paused request
+        let simplified: Vec<Value> = requests
+            .iter()
+            .map(|r| {
+                serde_json::json!({
+                    "requestId": r["requestId"],
+                    "url": r["request"]["url"],
+                    "method": r["request"]["method"],
+                    "headers": r["request"]["headers"],
+                    "postData": r["request"]["postData"],
+                    "resourceType": r["resourceType"],
+                })
+            })
+            .collect();
+        Ok(Value::Array(simplified))
+    }
+
+    /// Continue a paused request, optionally modifying headers or POST body.
+    pub async fn fetch_continue(
+        &self,
+        request_id: &str,
+        url: Option<&str>,
+        headers: Option<&Value>,
+        post_data: Option<&str>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let mut params = serde_json::json!({"requestId": request_id});
+        if let Some(u) = url {
+            params["url"] = Value::String(u.to_string());
+        }
+        if let Some(h) = headers {
+            params["headers"] = h.clone();
+        }
+        if let Some(b) = post_data {
+            params["postData"] = Value::String(b.to_string());
+        }
+        self.send("Fetch.continueRequest", Some(params)).await?;
+        Ok(())
+    }
+
+    /// Fulfill a paused request with a custom response (bypass the server entirely).
+    pub async fn fetch_fulfill(
+        &self,
+        request_id: &str,
+        response_code: u16,
+        body: &str,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        self.send(
+            "Fetch.fulfillRequest",
+            Some(serde_json::json!({
+                "requestId": request_id,
+                "responseCode": response_code,
+                "body": base64::Engine::encode(&base64::engine::general_purpose::STANDARD, body.as_bytes()),
+                "responseHeaders": [{"name": "content-type", "value": "application/json"}]
+            })),
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// Block a paused request.
+    pub async fn fetch_fail(&self, request_id: &str) -> Result<(), Box<dyn std::error::Error>> {
+        self.send(
+            "Fetch.failRequest",
+            Some(serde_json::json!({
+                "requestId": request_id,
+                "errorReason": "Aborted"
+            })),
+        )
+        .await?;
+        Ok(())
+    }
+
+    // ================================================================
+    // COOKIES — Precise Auth Control
+    // ================================================================
+
+    /// Set a cookie on a domain.
+    pub async fn set_cookie(
+        &self,
+        name: &str,
+        value: &str,
+        domain: &str,
+        path: Option<&str>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        self.send(
+            "Network.setCookie",
+            Some(serde_json::json!({
+                "name": name,
+                "value": value,
+                "domain": domain,
+                "path": path.unwrap_or("/")
+            })),
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// Delete cookies matching name and domain.
+    pub async fn delete_cookies(
+        &self,
+        name: &str,
+        domain: &str,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        self.send(
+            "Network.deleteCookies",
+            Some(serde_json::json!({
+                "name": name,
+                "domain": domain
+            })),
+        )
+        .await?;
+        Ok(())
     }
 
     // ================================================================

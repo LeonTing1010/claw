@@ -1669,4 +1669,37 @@ pipeline:
         assert_eq!(health.min_rows, Some(3));
         assert!(health.non_empty.is_none());
     }
+
+    #[test]
+    fn no_js_click_injection_in_adapters() {
+        // Constraint: adapters must use CDP native click (click/click_selector steps),
+        // never JS .click() in evaluate steps — JS clicks get blocked by anti-crawl.
+        let forbidden = [".click()", "dispatchEvent("];
+        // Only check repo adapters, not synced ~/.claw/adapters/
+        for base in ["adapters"] {
+            let base_path = std::path::Path::new(&base);
+            if !base_path.exists() {
+                continue;
+            }
+            for entry in std::fs::read_dir(base_path).unwrap().flatten() {
+                if !entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+                    continue;
+                }
+                for file in std::fs::read_dir(entry.path()).unwrap().flatten() {
+                    let path = file.path();
+                    if path.extension().map(|e| e == "yaml").unwrap_or(false) {
+                        let content = std::fs::read_to_string(&path).unwrap();
+                        for pat in &forbidden {
+                            assert!(
+                                !content.contains(pat),
+                                "adapter {} contains forbidden JS injection pattern '{}' — use click/click_selector steps instead",
+                                path.display(),
+                                pat
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
 }
