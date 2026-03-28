@@ -54,9 +54,7 @@ pub async fn serve(port: u16, headless: bool) -> Result<(), Box<dyn std::error::
             "tools/call" => {
                 // Ensure CDP client is connected
                 if client.is_none() {
-                    browser::ensure_chrome(port, headless).await?;
-                    let ws_url = CdpClient::discover_ws_url(port).await?;
-                    client = Some(CdpClient::connect(&ws_url).await?);
+                    client = Some(browser::connect_browser(port, headless).await?);
                 }
                 handle_tool_call(&id, &request["params"], client.as_ref().unwrap()).await
             }
@@ -394,7 +392,7 @@ fn tools_schema() -> Value {
         },
         {
             "name": "download",
-            "description": "Download a URL to a local file. Returns file path and size.",
+            "description": "Download a URL to a local file using the browser session (cookies, referer, auth). Works with auth-gated and anti-hotlink URLs.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -402,6 +400,18 @@ fn tools_schema() -> Value {
                     "output": { "type": "string", "description": "Output file path" }
                 },
                 "required": ["url", "output"]
+            }
+        },
+        {
+            "name": "save_image",
+            "description": "Download an image from the current page by CSS selector. Uses the browser session so it works with auth-gated images.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "selector": { "type": "string", "description": "CSS selector of the image element (e.g. 'img.hero', '#main-photo')" },
+                    "output": { "type": "string", "description": "Output file path (e.g. '/tmp/image.png')" }
+                },
+                "required": ["selector", "output"]
             }
         },
         {
@@ -418,6 +428,19 @@ fn tools_schema() -> Value {
                     "site": { "type": "string", "description": "Site name (e.g. 'weibo', 'bilibili')" },
                     "name": { "type": "string", "description": "Adapter name (e.g. 'hot', 'trending')" },
                     "args": { "type": "object", "description": "Adapter arguments (e.g. {limit: 10})", "additionalProperties": true }
+                },
+                "required": ["site", "name"]
+            }
+        },
+        {
+            "name": "check_adapter",
+            "description": "Health check a claw — run it and validate output against health/schema contracts. Returns status (Healthy/Degraded/Broken) and per-check results.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "site": { "type": "string", "description": "Site name" },
+                    "name": { "type": "string", "description": "Adapter name" },
+                    "args": { "type": "object", "description": "Adapter arguments", "additionalProperties": true }
                 },
                 "required": ["site", "name"]
             }
@@ -649,22 +672,13 @@ async fn execute_tool(
         "download" => {
             let url = args["url"].as_str().ok_or("missing url")?;
             let output = args["output"].as_str().ok_or("missing output")?;
-            let http = reqwest::Client::new();
-            let resp = http
-                .get(url)
-                .send()
-                .await
-                .map_err(|e| -> Box<dyn std::error::Error> {
-                    format!("download failed: {}", e).into()
-                })?;
-            let bytes = resp
-                .bytes()
-                .await
-                .map_err(|e| -> Box<dyn std::error::Error> {
-                    format!("download read failed: {}", e).into()
-                })?;
-            std::fs::write(output, &bytes)?;
-            Ok(json!(format!("{} ({} bytes)", output, bytes.len())))
+            let size = client.download_via_browser(url, output).await?;
+            Ok(json!(format!("{} ({} bytes)", output, size)))
+        }
+        "save_image" => {
+            let selector = args["selector"].as_str().ok_or("missing selector")?;
+            let output = args["output"].as_str().ok_or("missing output")?;
+            client.save_image(selector, output).await
         }
         "list_adapters" => {
             let base_dirs = crate::adapter::adapter_base_dirs();
@@ -712,6 +726,45 @@ async fn execute_tool(
                 "count": json_rows.len()
             }))
         }
+        "check_adapter" => {
+            let site = args["site"].as_str().ok_or("missing site")?;
+            let name = args["name"].as_str().ok_or("missing name")?;
+
+            let home = std::env::var("HOME").unwrap_or_default();
+            let dirs = ["adapters".to_string(), format!("{}/.claw/adapters", home)];
+            let refs: Vec<&str> = dirs.iter().map(|s| s.as_str()).collect();
+            let ada = crate::adapter::load_adapter(&refs, site, name)?;
+
+            let mut adapter_args = HashMap::new();
+            if let Some(ref defs) = ada.args {
+                for (key, def) in defs {
+                    if let Some(ref default) = def.default {
+                        adapter_args.insert(key.clone(), default.clone());
+                    }
+                }
+            }
+            if let Some(obj) = args["args"].as_object() {
+                for (k, v) in obj {
+                    adapter_args.insert(k.clone(), v.clone());
+                }
+            }
+
+            match crate::adapter::run_adapter(Some(client), site, name, adapter_args, 0).await {
+                Ok((_cols, rows)) => {
+                    let report = crate::health::validate(&ada, &rows);
+                    Ok(serde_json::to_value(&report)?)
+                }
+                Err(e) => Ok(json!({
+                    "adapter": format!("{}/{}", site, name),
+                    "status": "Broken",
+                    "checks": [{
+                        "name": "execution",
+                        "passed": false,
+                        "message": format!("pipeline error: {}", e)
+                    }]
+                })),
+            }
+        }
         _ => Err(format!("unknown tool: {}", name).into()),
     }
 }
@@ -740,6 +793,20 @@ mod tests {
         );
         // run_adapter must require site and name
         let tool = tools.iter().find(|t| t["name"] == "run_adapter").unwrap();
+        let required = tool["inputSchema"]["required"].as_array().unwrap();
+        assert!(required.contains(&json!("site")));
+        assert!(required.contains(&json!("name")));
+    }
+
+    #[test]
+    fn tools_schema_includes_check_adapter() {
+        let schema = tools_schema();
+        let tools = schema.as_array().unwrap();
+        assert!(
+            tools.iter().any(|t| t["name"] == "check_adapter"),
+            "MCP tools must include check_adapter"
+        );
+        let tool = tools.iter().find(|t| t["name"] == "check_adapter").unwrap();
         let required = tool["inputSchema"]["required"].as_array().unwrap();
         assert!(required.contains(&json!("site")));
         assert!(required.contains(&json!("name")));

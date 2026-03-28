@@ -14,6 +14,14 @@ args:
 
 columns: [project, download_count]
 
+schema:
+  project: string
+  download_count: int
+
+health:
+  min_rows: 10
+  non_empty: [project]
+
 pipeline:
   - fetch: https://hugovk.github.io/top-pypi-packages/top-pypi-packages-30-days.min.json
   - select: rows

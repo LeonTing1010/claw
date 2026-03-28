@@ -1,0 +1,40 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <style>
+    body {
+      width: 240px;
+      padding: 12px;
+      font-family: -apple-system, BlinkMacSystemFont, sans-serif;
+      font-size: 13px;
+      color: #333;
+    }
+    .status {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      margin-bottom: 8px;
+    }
+    .dot {
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+    }
+    .dot.on { background: #22c55e; }
+    .dot.off { background: #ef4444; }
+    .label { font-weight: 600; }
+    .info { color: #888; font-size: 11px; margin-top: 4px; }
+    .tab-info { margin-top: 8px; padding: 8px; background: #f5f5f5; border-radius: 6px; font-size: 11px; }
+  </style>
+</head>
+<body>
+  <div class="status">
+    <div class="dot" id="dot"></div>
+    <span class="label">Claw Bridge</span>
+  </div>
+  <div id="status-text"></div>
+  <div id="tab-info" class="tab-info" style="display:none"></div>
+  <div class="info">Connects your browser to Claw CLI</div>
+  <script src="popup.js"></script>
+</body>
+</html>

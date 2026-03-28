@@ -12,6 +12,15 @@ args:
 
 columns: [rank, title, hot]
 
+schema:
+  rank: int
+  title: string
+  hot: int
+
+health:
+  min_rows: 5
+  non_empty: [title]
+
 pipeline:
   - navigate: https://news.ycombinator.com/
   - wait: 2

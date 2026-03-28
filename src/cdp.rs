@@ -92,6 +92,60 @@ if (window.outerWidth === 0) {
 if (window.outerHeight === 0) {
     Object.defineProperty(window, 'outerHeight', { get: () => window.innerHeight });
 }
+
+// 8. Remove CDP runtime leak variables (cdc_, $cdc_, $chrome_)
+// Chromedriver leaves detectable globals
+(function() {
+    for (const key of Object.keys(window)) {
+        if (/^(cdc_|[$]cdc_|[$]chrome_)/.test(key)) {
+            delete window[key];
+        }
+    }
+})();
+
+// 9. navigator.connection — headless has different networkInfo
+if (navigator.connection === undefined) {
+    Object.defineProperty(navigator, 'connection', {
+        get: () => ({
+            effectiveType: '4g',
+            rtt: 50,
+            downlink: 10,
+            saveData: false,
+        }),
+    });
+}
+
+// 10. Consistent screen dimensions — headless often has 0 or mismatched values
+if (screen.availWidth === 0 || screen.width === 0) {
+    Object.defineProperty(screen, 'width', { get: () => 1280 });
+    Object.defineProperty(screen, 'height', { get: () => 720 });
+    Object.defineProperty(screen, 'availWidth', { get: () => 1280 });
+    Object.defineProperty(screen, 'availHeight', { get: () => 720 });
+    Object.defineProperty(screen, 'colorDepth', { get: () => 24 });
+    Object.defineProperty(screen, 'pixelDepth', { get: () => 24 });
+}
+
+// 11. Notification.permission — headless returns "denied"
+if (typeof Notification !== 'undefined' && Notification.permission === 'denied') {
+    Object.defineProperty(Notification, 'permission', { get: () => 'default' });
+}
+
+// 12. Iframe contentWindow detection — headless leaks in cross-origin frames
+(function() {
+    const origAppend = HTMLElement.prototype.appendChild;
+    HTMLElement.prototype.appendChild = function(el) {
+        if (el instanceof HTMLIFrameElement) {
+            const result = origAppend.call(this, el);
+            try {
+                Object.defineProperty(el, 'contentWindow', {
+                    get: () => el.contentWindow,
+                });
+            } catch(e) {}
+            return result;
+        }
+        return origAppend.call(this, el);
+    };
+})();
 "#;
 
 /// CDP JSON-RPC request
@@ -362,11 +416,75 @@ impl CdpClient {
         Ok(client)
     }
 
+    /// Connect from a raw TCP stream (used by Chrome extension bridge).
+    /// Performs WebSocket handshake, then operates like a normal CDP connection.
+    /// When `stealth` is false, skips stealth patches (user's real browser doesn't need them).
+    pub async fn connect_from_stream(
+        tcp_stream: tokio::net::TcpStream,
+        stealth: bool,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        let tls_stream = MaybeTlsStream::Plain(tcp_stream);
+        let ws_stream = tokio_tungstenite::accept_async(tls_stream).await?;
+        let (write, read) = ws_stream.split();
+
+        let pending: PendingMap = Arc::new(Mutex::new(HashMap::new()));
+        let network_log: NetworkLog = Arc::new(Mutex::new(Vec::new()));
+        let pending_requests: PendingRequests = Arc::new(Mutex::new(HashMap::new()));
+        let network_capture_active: Arc<Mutex<bool>> = Arc::new(Mutex::new(false));
+        let (tx, mut rx) = mpsc::channel::<Message>(64);
+
+        let mut write = write;
+        tokio::spawn(async move {
+            while let Some(msg) = rx.recv().await {
+                if write.send(msg).await.is_err() {
+                    break;
+                }
+            }
+        });
+
+        let pending_clone = pending.clone();
+        let net_log_clone = network_log.clone();
+        let pending_req_clone = pending_requests.clone();
+        let net_active_clone = network_capture_active.clone();
+        tokio::spawn(async move {
+            Self::read_loop(
+                read,
+                pending_clone,
+                net_log_clone,
+                pending_req_clone,
+                net_active_clone,
+            )
+            .await;
+        });
+
+        let client = Self {
+            tx,
+            pending,
+            next_id: Arc::new(Mutex::new(1)),
+            network_log,
+            pending_requests,
+            network_capture_active,
+        };
+        if stealth {
+            client.ensure_stealth().await?;
+        }
+        Ok(client)
+    }
+
     /// Inject stealth patches before any page load.
     /// Uses Page.addScriptToEvaluateOnNewDocument — a CDP protocol command
     /// that runs JS before each page's main script context initializes.
     async fn ensure_stealth(&self) -> Result<(), Box<dyn std::error::Error>> {
         self.send("Page.enable", None).await?;
+        // Override User-Agent to remove "HeadlessChrome" indicator
+        let _ = self
+            .send(
+                "Network.setUserAgentOverride",
+                Some(serde_json::json!({
+                    "userAgent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+                })),
+            )
+            .await;
         self.send(
             "Page.addScriptToEvaluateOnNewDocument",
             Some(serde_json::json!({ "source": STEALTH_JS })),
@@ -540,19 +658,33 @@ impl CdpClient {
         Ok(result["result"]["value"].clone())
     }
 
-    /// Click at exact coordinates via CDP native mouse events
+    /// Click at exact coordinates via CDP native mouse events.
+    /// Adds random jitter between press/release to mimic human timing.
     pub async fn click(&self, x: f64, y: f64) -> Result<(), Box<dyn std::error::Error>> {
         self.send(
             "Input.dispatchMouseEvent",
             Some(mouse_event_params("mousePressed", x, y)),
         )
         .await?;
+        // Human-like delay between press and release (50-150ms)
+        tokio::time::sleep(Self::random_delay(50, 150)).await;
         self.send(
             "Input.dispatchMouseEvent",
             Some(mouse_event_params("mouseReleased", x, y)),
         )
         .await?;
         Ok(())
+    }
+
+    /// Random delay for humanizing timing patterns
+    fn random_delay(min_ms: u64, max_ms: u64) -> std::time::Duration {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let seed = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .subsec_nanos() as u64;
+        let delta = (seed % (max_ms - min_ms)) + min_ms;
+        std::time::Duration::from_millis(delta)
     }
 
     // ================================================================
@@ -1632,7 +1764,8 @@ impl CdpClient {
 
         // If no page target exists, create one via /json/new
         if !targets.iter().any(|t| t["type"].as_str() == Some("page")) {
-            let new_body = Self::http_get(port, "/json/new").await?;
+            // Chrome 146+ requires PUT for /json/new (GET was deprecated)
+            let new_body = Self::http_request(port, "PUT", "/json/new").await?;
             let new_target: Value = serde_json::from_str(&new_body)?;
             let ws_url = new_target["webSocketDebuggerUrl"]
                 .as_str()
@@ -1656,6 +1789,54 @@ impl CdpClient {
             .ok_or("page target missing webSocketDebuggerUrl")?;
 
         Ok(ws_url.to_string())
+    }
+
+    /// HTTP request with configurable method (PUT, GET, etc.) for Chrome CDP endpoints.
+    pub async fn http_request(
+        port: u16,
+        method: &str,
+        path: &str,
+    ) -> Result<String, Box<dyn std::error::Error>> {
+        let addr = format!("127.0.0.1:{}", port);
+        let path = path.to_string();
+        let method = method.to_string();
+
+        let body = tokio::task::spawn_blocking(move || {
+            use std::io::{BufRead, BufReader, Read, Write};
+            let stream = std::net::TcpStream::connect(&addr)
+                .map_err(|e| format!("cannot connect to Chrome on {}: {}", addr, e))?;
+            stream
+                .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                .map_err(|e| e.to_string())?;
+            let req = format!(
+                "{} {} HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n\r\n",
+                method, path, addr
+            );
+            (&stream)
+                .write_all(req.as_bytes())
+                .map_err(|e| e.to_string())?;
+
+            let mut reader = BufReader::new(&stream);
+            let mut content_length: usize = 0;
+
+            loop {
+                let mut line = String::new();
+                reader.read_line(&mut line).map_err(|e| e.to_string())?;
+                let trimmed = line.trim();
+                if trimmed.is_empty() {
+                    break;
+                }
+                if let Some(val) = trimmed.strip_prefix("Content-Length:") {
+                    content_length = val.trim().parse().unwrap_or(0);
+                }
+            }
+
+            let mut body = vec![0u8; content_length];
+            reader.read_exact(&mut body).map_err(|e| e.to_string())?;
+            String::from_utf8(body).map_err(|e| e.to_string())
+        })
+        .await??;
+        Ok(body)
     }
 
     /// Minimal synchronous HTTP GET against Chrome's CDP HTTP endpoints.
@@ -1703,6 +1884,144 @@ impl CdpClient {
 
         Ok(body)
     }
+
+    // ================================================================
+    // DOWNLOAD — Browser-context file download (carries cookies/referer)
+    // ================================================================
+
+    /// Generate JS that fetches a URL using the browser's session and returns base64 data.
+    /// This carries cookies, referer, and auth headers — unlike raw HTTP.
+    pub fn download_js(url: &str) -> String {
+        format!(
+            r#"(async () => {{
+                const resp = await fetch({url}, {{ credentials: 'include' }});
+                if (!resp.ok) throw new Error('HTTP ' + resp.status);
+                const blob = await resp.blob();
+                return await new Promise((resolve, reject) => {{
+                    const reader = new FileReader();
+                    reader.onloadend = () => resolve(JSON.stringify({{
+                        base64: reader.result.split(',')[1],
+                        mime: blob.type,
+                        size: blob.size
+                    }}));
+                    reader.onerror = reject;
+                    reader.readAsDataURL(blob);
+                }});
+            }})()"#,
+            url = js_str(url)
+        )
+    }
+
+    /// Download a URL using the browser's session (cookies/referer) and save to a local file.
+    pub async fn download_via_browser(
+        &self,
+        url: &str,
+        output: &str,
+    ) -> Result<usize, Box<dyn std::error::Error>> {
+        let js = Self::download_js(url);
+        let result = self.evaluate(&js).await?;
+        let json_str = result.as_str().ok_or("expected JSON string from fetch")?;
+        let parsed: Value = serde_json::from_str(json_str)?;
+        let base64_data = parsed["base64"]
+            .as_str()
+            .ok_or("missing base64 field in response")?;
+        let bytes = base64_decode(base64_data)?;
+        let size = bytes.len();
+        std::fs::write(output, &bytes)?;
+        Ok(size)
+    }
+
+    /// Generate JS that finds an image by CSS selector, resolves its src, and fetches it as base64.
+    pub fn save_image_js(selector: &str) -> String {
+        format!(
+            r#"(async () => {{
+                const el = document.querySelector({sel});
+                if (!el) throw new Error('element not found: ' + {sel});
+                const url = el.currentSrc || el.src || el.getAttribute('src') || el.style.backgroundImage?.replace(/url\(["']?|["']?\)/g, '');
+                if (!url) throw new Error('no image source on element');
+                const resp = await fetch(url, {{ credentials: 'include' }});
+                if (!resp.ok) throw new Error('HTTP ' + resp.status);
+                const blob = await resp.blob();
+                return await new Promise((resolve, reject) => {{
+                    const reader = new FileReader();
+                    reader.onloadend = () => resolve(JSON.stringify({{
+                        base64: reader.result.split(',')[1],
+                        mime: blob.type,
+                        size: blob.size,
+                        url: url
+                    }}));
+                    reader.onerror = reject;
+                    reader.readAsDataURL(blob);
+                }});
+            }})()"#,
+            sel = js_str(selector)
+        )
+    }
+
+    /// Download an image from the current page by CSS selector and save to a local file.
+    pub async fn save_image(
+        &self,
+        selector: &str,
+        output: &str,
+    ) -> Result<Value, Box<dyn std::error::Error>> {
+        let js = Self::save_image_js(selector);
+        let result = self.evaluate(&js).await?;
+        let json_str = result.as_str().ok_or("expected JSON string from fetch")?;
+        let parsed: Value = serde_json::from_str(json_str)?;
+        let base64_data = parsed["base64"]
+            .as_str()
+            .ok_or("missing base64 field in response")?;
+        let bytes = base64_decode(base64_data)?;
+        let size = bytes.len();
+        std::fs::write(output, &bytes)?;
+        Ok(serde_json::json!({
+            "path": output,
+            "size": size,
+            "mime": parsed["mime"],
+            "url": parsed["url"]
+        }))
+    }
+}
+
+/// Decode base64 string to bytes.
+fn base64_decode(input: &str) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+    // Simple base64 decode without external dependency
+    let mut result = Vec::new();
+    let lut: Vec<u8> = {
+        let mut table = vec![255u8; 256];
+        for (i, &c) in b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+            .iter()
+            .enumerate()
+        {
+            table[c as usize] = i as u8;
+        }
+        table
+    };
+    let clean: Vec<u8> = input
+        .bytes()
+        .filter(|&b| b != b'\n' && b != b'\r' && b != b'=')
+        .collect();
+    let chunks = clean.chunks(4);
+    for chunk in chunks {
+        let mut buf = [0u8; 4];
+        for (i, &b) in chunk.iter().enumerate() {
+            buf[i] = lut[b as usize];
+            if buf[i] == 255 {
+                return Err(format!("invalid base64 character: {}", b as char).into());
+            }
+        }
+        let n = chunk.len();
+        if n >= 2 {
+            result.push((buf[0] << 2) | (buf[1] >> 4));
+        }
+        if n >= 3 {
+            result.push((buf[1] << 4) | (buf[2] >> 2));
+        }
+        if n >= 4 {
+            result.push((buf[2] << 6) | buf[3]);
+        }
+    }
+    Ok(result)
 }
 
 #[cfg(test)]
@@ -2090,6 +2409,64 @@ mod tests {
         assert_eq!(
             hints.submit_button.as_ref().unwrap().selector,
             "button.submit"
+        );
+    }
+
+    // --- download_via_browser: uses page JS fetch (carries cookies/referer) ---
+    // Why: raw reqwest bypasses browser session — auth-gated images, anti-hotlink fail
+
+    #[test]
+    fn download_js_snippet_uses_fetch_and_returns_base64() {
+        // The JS snippet must use fetch() (browser context) not XMLHttpRequest
+        // and must return base64-encoded data for binary content
+        let js = CdpClient::download_js("https://example.com/img.png");
+        assert!(
+            js.contains("fetch("),
+            "must use fetch() for browser session"
+        );
+        assert!(
+            js.contains("base64") || js.contains("btoa") || js.contains("FileReader"),
+            "must encode binary as base64 for transport"
+        );
+        assert!(
+            js.contains("https://example.com/img.png"),
+            "must contain the target URL"
+        );
+    }
+
+    #[test]
+    fn base64_decode_roundtrip() {
+        // Why: download pipeline depends on correct base64 decode of browser fetch response
+        let decoded = super::base64_decode("SGVsbG8gV29ybGQ=").unwrap();
+        assert_eq!(decoded, b"Hello World");
+    }
+
+    #[test]
+    fn base64_decode_binary_data() {
+        // PNG magic bytes: 0x89 0x50 0x4E 0x47
+        let decoded = super::base64_decode("iVBORw==").unwrap();
+        assert_eq!(decoded[0], 0x89);
+        assert_eq!(decoded[1], 0x50);
+        assert_eq!(decoded[2], 0x4E);
+        assert_eq!(decoded[3], 0x47);
+    }
+
+    #[test]
+    fn save_image_js_snippet_resolves_selector_src() {
+        // save_image must: find element by selector → get its src/currentSrc → fetch it
+        let js = CdpClient::save_image_js("img.hero");
+        assert!(
+            js.contains("querySelector"),
+            "must use querySelector to find element"
+        );
+        assert!(js.contains("img.hero"), "must contain the CSS selector");
+        assert!(
+            js.contains("currentSrc") || js.contains(".src"),
+            "must resolve the image source URL"
+        );
+        assert!(
+            js.contains("fetch("),
+            "must fetch the resolved URL via browser context"
         );
     }
 }

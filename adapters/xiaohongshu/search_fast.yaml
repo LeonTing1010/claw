@@ -1,0 +1,87 @@
+site: xiaohongshu
+name: search_fast
+description: 纯 HTTP 搜索小红书（无浏览器，从 SSR HTML 提取 __INITIAL_STATE__）
+domain: xiaohongshu.com
+strategy: public
+browser: false
+version: "1"
+last_forged: "2026-03-28"
+forged_by: "claude-opus-4"
+
+args:
+  keyword:
+    type: string
+  limit:
+    type: int
+    default: 20
+
+columns: [title, likes, comments, collects, author, note_id]
+
+pipeline:
+  - fetch:
+      url: "https://www.xiaohongshu.com/search_result?keyword=${{ args.keyword }}&type=51"
+      method: GET
+      headers:
+        user-agent: "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+        accept: "text/html,application/xhtml+xml"
+  - transform: |
+      -- data[1] is the raw HTML string from fetch
+      local html = tostring(data[1])
+
+      -- Extract __INITIAL_STATE__ JSON from script tag
+      -- The SSR state uses JS object syntax (contains undefined), not pure JSON
+      -- Strategy: find the JSON-like block and fix undefined → null
+      local start = html:find("__INITIAL_STATE__%%s*=%%s*")
+      if not start then return {{ title = "ERROR: no __INITIAL_STATE__ found", likes = "0", comments = "0", collects = "0", author = "", note_id = "" }} end
+
+      -- Find the start of the JSON object after the assignment
+      local json_start = html:find("{", start)
+      if not json_start then return {{ title = "ERROR: no JSON start", likes = "0", comments = "0", collects = "0", author = "", note_id = "" }} end
+
+      -- Find matching closing brace (track depth)
+      local depth = 0
+      local json_end = json_start
+      for i = json_start, math.min(json_start + 500000, #html) do
+        local c = html:sub(i, i)
+        if c == "{" then depth = depth + 1
+        elseif c == "}" then
+          depth = depth - 1
+          if depth == 0 then json_end = i; break end
+        end
+      end
+
+      local raw = html:sub(json_start, json_end)
+      -- Fix JS-specific values that aren't valid JSON
+      raw = raw:gsub(":undefined", ":null")
+      raw = raw:gsub(",undefined", ",null")
+
+      -- Parse JSON
+      local ok, state = pcall(json.decode, raw)
+      if not ok then return {{ title = "ERROR: JSON parse failed: " .. tostring(state):sub(1,100), likes = "0", comments = "0", collects = "0", author = "", note_id = "" }} end
+
+      -- Navigate to feeds
+      local search = state and state.search
+      if not search then return {{ title = "ERROR: no search in state", likes = "0", comments = "0", collects = "0", author = "", note_id = "" }} end
+
+      -- feeds might be a Vue ref wrapper with _rawValue/_value, or direct array
+      local feeds = search.feeds
+      if type(feeds) == "table" and feeds._rawValue then feeds = feeds._rawValue end
+      if type(feeds) == "table" and feeds._value then feeds = feeds._value end
+
+      if type(feeds) ~= "table" then return {{ title = "ERROR: feeds not table, type=" .. type(feeds), likes = "0", comments = "0", collects = "0", author = "", note_id = "" }} end
+
+      local results = {}
+      for _, item in ipairs(feeds) do
+        local nc = item.noteCard or item.note_card or {}
+        local interact = nc.interactInfo or nc.interact_info or {}
+        table.insert(results, {
+          title = nc.displayTitle or nc.display_title or "",
+          likes = tostring(interact.likedCount or interact.liked_count or 0),
+          comments = tostring(interact.commentCount or interact.comment_count or 0),
+          collects = tostring(interact.collectedCount or interact.collected_count or 0),
+          author = (nc.user or {}).nickname or "",
+          note_id = item.id or ""
+        })
+      end
+
+      return results

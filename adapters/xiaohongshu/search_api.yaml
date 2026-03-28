@@ -1,0 +1,51 @@
+site: xiaohongshu
+name: search_api
+description: 从 SSR state 提取小红书搜索完整数据（含评论数、收藏数、作者）
+domain: xiaohongshu.com
+strategy: cookie
+browser: true
+version: "2"
+last_forged: "2026-03-28"
+forged_by: "claude-opus-4"
+
+args:
+  keyword:
+    type: string
+  limit:
+    type: int
+    default: 20
+
+columns: [title, likes, comments, collects, author, note_id]
+
+pipeline:
+  - navigate: "https://www.xiaohongshu.com/search_result?keyword=${{ args.keyword }}&type=51"
+  - wait_for:
+      selector: "section.note-item"
+      timeout: "10"
+  - wait: 2
+  - evaluate: |
+      (() => {
+        const feeds = window.__INITIAL_STATE__?.search?.feeds?._value;
+        if (!feeds) return [];
+        const arr = Array.isArray(feeds) ? feeds : Object.values(feeds);
+        return arr.map(item => {
+          const nc = item?.noteCard || {};
+          const interact = nc?.interactInfo || {};
+          return {
+            title: nc?.displayTitle || "",
+            likes: String(interact?.likedCount || "0"),
+            comments: String(interact?.commentCount || "0"),
+            collects: String(interact?.collectedCount || "0"),
+            author: nc?.user?.nickname || "",
+            note_id: item?.id || ""
+          };
+        }).filter(item => item.title || item.likes !== "0");
+      })()
+  - map:
+      title: ${{ item.title }}
+      likes: ${{ item.likes }}
+      comments: ${{ item.comments }}
+      collects: ${{ item.collects }}
+      author: ${{ item.author }}
+      note_id: ${{ item.note_id }}
+  - limit: ${{ args.limit }}

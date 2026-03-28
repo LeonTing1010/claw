@@ -1,0 +1,73 @@
+site: weibo
+name: search
+description: 搜索微博内容，返回标题+互动数+作者
+domain: weibo.com
+strategy: cookie
+browser: true
+version: "1"
+last_forged: "2026-03-28"
+forged_by: "claude-opus-4"
+
+args:
+  keyword:
+    type: string
+  limit:
+    type: int
+    default: 20
+
+columns: [title, likes, author, url]
+
+pipeline:
+  - navigate: https://weibo.com
+  - wait: 3
+  - evaluate: |
+      (async () => {
+        try {
+          const keyword = decodeURIComponent("${{ args.keyword }}");
+          const encoded = encodeURIComponent(keyword);
+          const containerid = '100103type=1&q=' + encoded;
+          const res = await fetch(
+            'https://m.weibo.cn/api/container/getIndex?containerid=' + encodeURIComponent(containerid),
+            { credentials: 'include' }
+          );
+          const data = await res.json();
+          const cards = data.data?.cards || [];
+          const results = [];
+          for (const card of cards) {
+            if (card.card_type === 9) {
+              const mblog = card.mblog;
+              if (!mblog) continue;
+              // Strip HTML tags from text
+              const text = (mblog.text || '').replace(/<[^>]+>/g, '').trim();
+              results.push({
+                title: text.substring(0, 120),
+                likes: String(mblog.attitudes_count || 0),
+                author: mblog.user?.screen_name || '',
+                url: 'https://weibo.com/' + (mblog.user?.id || '') + '/' + (mblog.bid || '')
+              });
+            } else if (card.card_group) {
+              for (const sub of card.card_group) {
+                if (sub.card_type === 9 && sub.mblog) {
+                  const text = (sub.mblog.text || '').replace(/<[^>]+>/g, '').trim();
+                  results.push({
+                    title: text.substring(0, 120),
+                    likes: String(sub.mblog.attitudes_count || 0),
+                    author: sub.mblog.user?.screen_name || '',
+                    url: 'https://weibo.com/' + (sub.mblog.user?.id || '') + '/' + (sub.mblog.bid || '')
+                  });
+                }
+              }
+            }
+          }
+          return results.length > 0 ? results
+            : [{ title: 'No results — try visiting weibo.com first', likes: '0', author: '', url: '' }];
+        } catch(e) {
+          return [{ title: 'Error: ' + e.message, likes: '0', author: '', url: '' }];
+        }
+      })()
+  - map:
+      title: ${{ item.title }}
+      likes: ${{ item.likes }}
+      author: ${{ item.author }}
+      url: ${{ item.url }}
+  - limit: ${{ args.limit }}

@@ -1,0 +1,115 @@
+site: xiaohongshu
+name: post_detail
+description: 搜索→点击→从弹窗SSR state提取帖子详情+评论内容
+domain: xiaohongshu.com
+strategy: cookie
+browser: true
+version: "4"
+last_forged: "2026-03-28"
+forged_by: "claude-opus-4"
+
+args:
+  keyword:
+    type: string
+  index:
+    type: int
+    default: 0
+
+columns: [type, content, likes, author]
+
+pipeline:
+  # Step 1: 搜索
+  - navigate: "https://www.xiaohongshu.com/search_result?keyword=${{ args.keyword }}&type=51"
+  - wait_for:
+      selector: "section.note-item"
+      timeout: "10"
+  - wait: 2
+
+  # Step 2: 点击帖子打开弹窗
+  - evaluate: |
+      (() => {
+        const notes = document.querySelectorAll('section.note-item a');
+        const idx = ${{ args.index }};
+        const el = notes[idx] || notes[0];
+        if (el) { el.click(); return []; }
+        return [];
+      })()
+
+  # Step 3: 等待弹窗加载评论数据到 SSR state
+  - wait: 5
+
+  # Step 4: 从 __INITIAL_STATE__.note.noteDetailMap 提取评论
+  - evaluate: |
+      (() => {
+        const results = [];
+
+        // Vue 3 reactive unwrap via JSON round-trip
+        let noteMap;
+        try {
+          noteMap = JSON.parse(JSON.stringify(
+            window.__INITIAL_STATE__?.note?.noteDetailMap || {}
+          ));
+        } catch(e) {
+          return [{ type: 'error', content: 'parse failed: ' + e.message, likes: '0', author: '' }];
+        }
+
+        for (const [noteId, detail] of Object.entries(noteMap)) {
+          const note = detail?.note || {};
+          // Skip empty placeholder entries
+          if (!note.title && !note.desc && !note.noteId) continue;
+
+          const interact = note.interactInfo || {};
+
+          // Note info
+          results.push({
+            type: 'note',
+            content: (note.title || note.displayTitle || '') + '\n' + (note.desc || '').substring(0, 500),
+            likes: String(interact.likedCount || 0),
+            author: (note.user || {}).nickname || ''
+          });
+
+          // Engagement summary
+          results.push({
+            type: 'engagement',
+            content: 'likes:' + (interact.likedCount||0) + ' comments:' + (interact.commentCount||0) + ' collects:' + (interact.collectedCount||0),
+            likes: String(interact.likedCount || 0),
+            author: ''
+          });
+
+          // Comments from the detail
+          const commentList = detail?.comments?.list || [];
+          for (const c of commentList) {
+            const text = c.content || '';
+            if (text.length < 2) continue;
+            results.push({
+              type: 'comment',
+              content: text.substring(0, 300),
+              likes: String(c.likeCount || 0),
+              author: (c.userInfo || {}).nickname || ''
+            });
+
+            // Sub-comments (replies)
+            const subComments = c.subComments || [];
+            for (const sc of subComments) {
+              if ((sc.content || '').length < 2) continue;
+              results.push({
+                type: 'reply',
+                content: sc.content.substring(0, 300),
+                likes: String(sc.likeCount || 0),
+                author: (sc.userInfo || {}).nickname || ''
+              });
+            }
+          }
+        }
+
+        if (results.length === 0) {
+          results.push({ type: 'info', content: 'no note detail loaded in state', likes: '0', author: '' });
+        }
+
+        return results;
+      })()
+  - map:
+      type: ${{ item.type }}
+      content: ${{ item.content }}
+      likes: ${{ item.likes }}
+      author: ${{ item.author }}

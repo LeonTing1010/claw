@@ -1,6 +1,8 @@
 mod adapter;
+mod bridge;
 mod browser;
 mod cdp;
+mod health;
 mod lua_adapter;
 mod mcp;
 mod output;
@@ -15,7 +17,11 @@ use clap_complete::{generate, Shell};
 use serde_json::Value;
 
 #[derive(Parser)]
-#[command(name = "claw", about = "Make every website programmable by AI")]
+#[command(
+    name = "claw",
+    about = "Make every website programmable by AI",
+    version
+)]
 #[command(allow_external_subcommands = true)]
 struct Cli {
     /// Chrome CDP debugging port
@@ -46,8 +52,8 @@ enum Command {
         /// Target URL
         url: String,
     },
-    /// Show browser connection info
-    Version,
+    /// Show browser connection info (WebSocket URL)
+    BrowserInfo,
     /// List available claws (website API specs)
     List,
     /// Download/update claws from GitHub
@@ -241,6 +247,20 @@ enum Command {
         adapter_args: Vec<String>,
     },
 
+    /// Health check: run claw and validate output against health/schema contracts
+    Check {
+        /// Site name (omit with --all)
+        site: Option<String>,
+        /// Claw name (omit with --all)
+        name: Option<String>,
+        /// Check all adapters that have health contracts
+        #[arg(long)]
+        all: bool,
+        /// Arguments as --key value pairs (passed through)
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        adapter_args: Vec<String>,
+    },
+
     /// Save a claw YAML to ~/.claw/adapters/ (backs up previous version)
     #[command(name = "save-adapter")]
     SaveAdapter {
@@ -305,24 +325,20 @@ async fn main() {
 async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     match cli.command {
         Command::Download { url, output } => {
-            let client = reqwest::Client::new();
-            let resp = client.get(&url).send().await?;
-            let bytes = resp.bytes().await?;
-            std::fs::write(&output, &bytes)?;
-            println!("{} ({} bytes)", output, bytes.len());
+            let client = browser::connect_browser(cli.port, cli.headless).await?;
+            let size = client.download_via_browser(&url, &output).await?;
+            println!("{} ({} bytes)", output, size);
         }
         Command::Mcp => {
             mcp::serve(cli.port, cli.headless).await?;
         }
-        Command::Version => {
+        Command::BrowserInfo => {
             browser::ensure_chrome(cli.port, cli.headless).await?;
             let ws_url = cdp::CdpClient::discover_ws_url(cli.port).await?;
             println!("{}", ws_url);
         }
         Command::Evaluate { expression } => {
-            browser::ensure_chrome(cli.port, cli.headless).await?;
-            let ws_url = cdp::CdpClient::discover_ws_url(cli.port).await?;
-            let client = cdp::CdpClient::connect(&ws_url).await?;
+            let client = browser::connect_browser(cli.port, cli.headless).await?;
             let result = client.evaluate(&expression).await?;
             let out = if result.is_string() {
                 result.as_str().unwrap().to_string()
@@ -332,9 +348,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             println!("{}", out);
         }
         Command::Navigate { url } => {
-            browser::ensure_chrome(cli.port, cli.headless).await?;
-            let ws_url = cdp::CdpClient::discover_ws_url(cli.port).await?;
-            let client = cdp::CdpClient::connect(&ws_url).await?;
+            let client = browser::connect_browser(cli.port, cli.headless).await?;
             client.navigate(&url).await?;
             println!("navigated to {}", url);
         }
@@ -449,9 +463,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         }
         // ---- SEE (Perception) ----
         Command::Screenshot { path, full_page } => {
-            browser::ensure_chrome(cli.port, cli.headless).await?;
-            let ws_url = cdp::CdpClient::discover_ws_url(cli.port).await?;
-            let client = cdp::CdpClient::connect(&ws_url).await?;
+            let client = browser::connect_browser(cli.port, cli.headless).await?;
             if full_page {
                 client.screenshot_full(&path).await?;
             } else {
@@ -460,31 +472,23 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             println!("{}", path);
         }
         Command::AxTree { depth } => {
-            browser::ensure_chrome(cli.port, cli.headless).await?;
-            let ws_url = cdp::CdpClient::discover_ws_url(cli.port).await?;
-            let client = cdp::CdpClient::connect(&ws_url).await?;
+            let client = browser::connect_browser(cli.port, cli.headless).await?;
             let tree = client.get_ax_tree(depth).await?;
             println!("{}", serde_json::to_string_pretty(&tree)?);
         }
         Command::ReadDom { selector, depth } => {
-            browser::ensure_chrome(cli.port, cli.headless).await?;
-            let ws_url = cdp::CdpClient::discover_ws_url(cli.port).await?;
-            let client = cdp::CdpClient::connect(&ws_url).await?;
+            let client = browser::connect_browser(cli.port, cli.headless).await?;
             let tree = client.get_dom_tree(selector.as_deref(), depth).await?;
             println!("{}", serde_json::to_string_pretty(&tree)?);
         }
         Command::PageInfo => {
-            browser::ensure_chrome(cli.port, cli.headless).await?;
-            let ws_url = cdp::CdpClient::discover_ws_url(cli.port).await?;
-            let client = cdp::CdpClient::connect(&ws_url).await?;
+            let client = browser::connect_browser(cli.port, cli.headless).await?;
             let info = client.get_page_info().await?;
             println!("{}", serde_json::to_string_pretty(&info)?);
         }
 
         Command::Explore { url, screenshot } => {
-            browser::ensure_chrome(cli.port, cli.headless).await?;
-            let ws_url = cdp::CdpClient::discover_ws_url(cli.port).await?;
-            let client = cdp::CdpClient::connect(&ws_url).await?;
+            let client = browser::connect_browser(cli.port, cli.headless).await?;
             if let Some(url) = url {
                 client.navigate(&url).await?;
             }
@@ -494,59 +498,43 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
 
         // ---- PROBE (Discovery) ----
         Command::Find { query, role } => {
-            browser::ensure_chrome(cli.port, cli.headless).await?;
-            let ws_url = cdp::CdpClient::discover_ws_url(cli.port).await?;
-            let client = cdp::CdpClient::connect(&ws_url).await?;
+            let client = browser::connect_browser(cli.port, cli.headless).await?;
             let results = client.find_elements(&query, role.as_deref()).await?;
             println!("{}", serde_json::to_string_pretty(&results)?);
         }
         Command::ElementInfo { selector } => {
-            browser::ensure_chrome(cli.port, cli.headless).await?;
-            let ws_url = cdp::CdpClient::discover_ws_url(cli.port).await?;
-            let client = cdp::CdpClient::connect(&ws_url).await?;
+            let client = browser::connect_browser(cli.port, cli.headless).await?;
             let info = client.get_element_info(&selector).await?;
             println!("{}", serde_json::to_string_pretty(&info)?);
         }
         Command::EventListeners { selector } => {
-            browser::ensure_chrome(cli.port, cli.headless).await?;
-            let ws_url = cdp::CdpClient::discover_ws_url(cli.port).await?;
-            let client = cdp::CdpClient::connect(&ws_url).await?;
+            let client = browser::connect_browser(cli.port, cli.headless).await?;
             let listeners = client.get_event_listeners(&selector).await?;
             println!("{}", serde_json::to_string_pretty(&listeners)?);
         }
         Command::Cookies => {
-            browser::ensure_chrome(cli.port, cli.headless).await?;
-            let ws_url = cdp::CdpClient::discover_ws_url(cli.port).await?;
-            let client = cdp::CdpClient::connect(&ws_url).await?;
+            let client = browser::connect_browser(cli.port, cli.headless).await?;
             let cookies = client.get_cookies().await?;
             println!("{}", serde_json::to_string_pretty(&cookies)?);
         }
         Command::HitTest { x, y } => {
-            browser::ensure_chrome(cli.port, cli.headless).await?;
-            let ws_url = cdp::CdpClient::discover_ws_url(cli.port).await?;
-            let client = cdp::CdpClient::connect(&ws_url).await?;
+            let client = browser::connect_browser(cli.port, cli.headless).await?;
             let result = client.hit_test(x, y).await?;
             println!("{}", serde_json::to_string_pretty(&result)?);
         }
         Command::TopLayer => {
-            browser::ensure_chrome(cli.port, cli.headless).await?;
-            let ws_url = cdp::CdpClient::discover_ws_url(cli.port).await?;
-            let client = cdp::CdpClient::connect(&ws_url).await?;
+            let client = browser::connect_browser(cli.port, cli.headless).await?;
             let elements = client.get_top_layer().await?;
             println!("{}", serde_json::to_string_pretty(&elements)?);
         }
         Command::ForceState { selector, states } => {
-            browser::ensure_chrome(cli.port, cli.headless).await?;
-            let ws_url = cdp::CdpClient::discover_ws_url(cli.port).await?;
-            let client = cdp::CdpClient::connect(&ws_url).await?;
+            let client = browser::connect_browser(cli.port, cli.headless).await?;
             let state_refs: Vec<&str> = states.iter().map(|s| s.as_str()).collect();
             client.force_pseudo_state(&selector, &state_refs).await?;
             println!("forced {:?} on {}", states, selector);
         }
         Command::NetworkLog { action } => {
-            browser::ensure_chrome(cli.port, cli.headless).await?;
-            let ws_url = cdp::CdpClient::discover_ws_url(cli.port).await?;
-            let client = cdp::CdpClient::connect(&ws_url).await?;
+            let client = browser::connect_browser(cli.port, cli.headless).await?;
             match action.as_str() {
                 "start" => {
                     client.start_network_log().await?;
@@ -568,51 +556,37 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
 
         // ---- TRY (Actions) ----
         Command::Hover { selector } => {
-            browser::ensure_chrome(cli.port, cli.headless).await?;
-            let ws_url = cdp::CdpClient::discover_ws_url(cli.port).await?;
-            let client = cdp::CdpClient::connect(&ws_url).await?;
+            let client = browser::connect_browser(cli.port, cli.headless).await?;
             client.hover_selector(&selector).await?;
             println!("hovered {}", selector);
         }
         Command::Scroll { selector } => {
-            browser::ensure_chrome(cli.port, cli.headless).await?;
-            let ws_url = cdp::CdpClient::discover_ws_url(cli.port).await?;
-            let client = cdp::CdpClient::connect(&ws_url).await?;
+            let client = browser::connect_browser(cli.port, cli.headless).await?;
             client.scroll_into_view(&selector).await?;
             println!("scrolled to {}", selector);
         }
         Command::PressKey { key, modifiers } => {
-            browser::ensure_chrome(cli.port, cli.headless).await?;
-            let ws_url = cdp::CdpClient::discover_ws_url(cli.port).await?;
-            let client = cdp::CdpClient::connect(&ws_url).await?;
+            let client = browser::connect_browser(cli.port, cli.headless).await?;
             client.press_key(&key, modifiers).await?;
             println!("pressed {}", key);
         }
         Command::Select { selector, value } => {
-            browser::ensure_chrome(cli.port, cli.headless).await?;
-            let ws_url = cdp::CdpClient::discover_ws_url(cli.port).await?;
-            let client = cdp::CdpClient::connect(&ws_url).await?;
+            let client = browser::connect_browser(cli.port, cli.headless).await?;
             client.select_option(&selector, &value).await?;
             println!("selected {} = {}", selector, value);
         }
         Command::Click { text } => {
-            browser::ensure_chrome(cli.port, cli.headless).await?;
-            let ws_url = cdp::CdpClient::discover_ws_url(cli.port).await?;
-            let client = cdp::CdpClient::connect(&ws_url).await?;
+            let client = browser::connect_browser(cli.port, cli.headless).await?;
             client.click_text(&text).await?;
             println!("clicked \"{}\"", text);
         }
         Command::ClickSelector { selector } => {
-            browser::ensure_chrome(cli.port, cli.headless).await?;
-            let ws_url = cdp::CdpClient::discover_ws_url(cli.port).await?;
-            let client = cdp::CdpClient::connect(&ws_url).await?;
+            let client = browser::connect_browser(cli.port, cli.headless).await?;
             client.click_selector(&selector).await?;
             println!("clicked {}", selector);
         }
         Command::Type { selector, text } => {
-            browser::ensure_chrome(cli.port, cli.headless).await?;
-            let ws_url = cdp::CdpClient::discover_ws_url(cli.port).await?;
-            let client = cdp::CdpClient::connect(&ws_url).await?;
+            let client = browser::connect_browser(cli.port, cli.headless).await?;
             client.type_into(&selector, &text).await?;
             println!("typed into {}", selector);
         }
@@ -620,9 +594,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             accept,
             prompt_text,
         } => {
-            browser::ensure_chrome(cli.port, cli.headless).await?;
-            let ws_url = cdp::CdpClient::discover_ws_url(cli.port).await?;
-            let client = cdp::CdpClient::connect(&ws_url).await?;
+            let client = browser::connect_browser(cli.port, cli.headless).await?;
             client
                 .dismiss_dialog(accept, prompt_text.as_deref())
                 .await?;
@@ -641,9 +613,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
 
-            browser::ensure_chrome(cli.port, cli.headless).await?;
-            let ws_url = cdp::CdpClient::discover_ws_url(cli.port).await?;
-            let client = cdp::CdpClient::connect(&ws_url).await?;
+            let client = browser::connect_browser(cli.port, cli.headless).await?;
 
             let label = pipeline::step_label(&parsed);
             let start = std::time::Instant::now();
@@ -703,9 +673,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 args.insert(k, v);
             }
 
-            browser::ensure_chrome(cli.port, cli.headless).await?;
-            let ws_url = cdp::CdpClient::discover_ws_url(cli.port).await?;
-            let client = cdp::CdpClient::connect(&ws_url).await?;
+            let client = browser::connect_browser(cli.port, cli.headless).await?;
 
             let results =
                 pipeline::execute_with_report(&ada.pipeline, Some(&client), args, 0).await;
@@ -727,6 +695,165 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
 
             if pass_count != total {
                 std::process::exit(1);
+            }
+        }
+
+        Command::Check {
+            site,
+            name,
+            all,
+            adapter_args,
+        } => {
+            let dirs = adapter::adapter_base_dirs();
+            let refs: Vec<&str> = dirs.iter().map(|s| s.as_str()).collect();
+
+            if all {
+                let adapters = adapter::list_adapters(&refs);
+                let mut reports = Vec::new();
+
+                for info in &adapters {
+                    let ada = match adapter::load_adapter(&refs, &info.site, &info.name) {
+                        Ok(a) => a,
+                        Err(_) => continue,
+                    };
+                    if ada.health.is_none() && ada.schema.is_none() {
+                        continue;
+                    }
+
+                    let mut args = HashMap::new();
+                    if let Some(ref defs) = ada.args {
+                        for (key, def) in defs {
+                            if let Some(ref default) = def.default {
+                                args.insert(key.clone(), default.clone());
+                            }
+                        }
+                    }
+
+                    let needs_browser = ada.run.is_some() || ada.browser != Some(false);
+                    let client = if needs_browser {
+                        match browser::connect_browser(cli.port, cli.headless).await {
+                            Ok(c) => Some(c),
+                            Err(e) => {
+                                reports.push(health::HealthReport {
+                                    adapter: format!("{}/{}", info.site, info.name),
+                                    status: health::HealthStatus::Broken,
+                                    checks: vec![health::CheckResult {
+                                        name: "execution".to_string(),
+                                        passed: false,
+                                        message: format!("browser connection failed: {}", e),
+                                    }],
+                                });
+                                continue;
+                            }
+                        }
+                    } else {
+                        None
+                    };
+
+                    match adapter::run_adapter(client.as_ref(), &info.site, &info.name, args, 0)
+                        .await
+                    {
+                        Ok((_cols, rows)) => {
+                            reports.push(health::validate(&ada, &rows));
+                        }
+                        Err(e) => {
+                            reports.push(health::HealthReport {
+                                adapter: format!("{}/{}", info.site, info.name),
+                                status: health::HealthStatus::Broken,
+                                checks: vec![health::CheckResult {
+                                    name: "execution".to_string(),
+                                    passed: false,
+                                    message: format!("pipeline error: {}", e),
+                                }],
+                            });
+                        }
+                    }
+                }
+
+                match cli.format.as_str() {
+                    "json" => println!("{}", serde_json::to_string_pretty(&reports)?),
+                    _ => {
+                        let mut any_broken = false;
+                        for r in &reports {
+                            let symbol = match r.status {
+                                health::HealthStatus::Healthy => "pass",
+                                health::HealthStatus::Degraded => "warn",
+                                health::HealthStatus::Broken => {
+                                    any_broken = true;
+                                    "FAIL"
+                                }
+                            };
+                            eprintln!("[{}] {}", symbol, r.adapter);
+                            for c in &r.checks {
+                                eprintln!(
+                                    "  {} {}: {}",
+                                    if c.passed { "+" } else { "-" },
+                                    c.name,
+                                    c.message
+                                );
+                            }
+                        }
+                        if reports.is_empty() {
+                            eprintln!("no adapters with health contracts found");
+                        }
+                        if any_broken {
+                            std::process::exit(1);
+                        }
+                    }
+                }
+            } else {
+                let site = site.ok_or("site is required (or use --all)")?;
+                let name = name.ok_or("name is required (or use --all)")?;
+                let ada = adapter::load_adapter(&refs, &site, &name)?;
+
+                let mut args = HashMap::new();
+                if let Some(ref defs) = ada.args {
+                    for (key, def) in defs {
+                        if let Some(ref default) = def.default {
+                            args.insert(key.clone(), default.clone());
+                        }
+                    }
+                }
+                let cli_args = parse_adapter_args(&adapter_args);
+                for (k, v) in cli_args {
+                    args.insert(k, v);
+                }
+
+                let needs_browser = ada.run.is_some() || ada.browser != Some(false);
+                let client = if needs_browser {
+                    Some(browser::connect_browser(cli.port, cli.headless).await?)
+                } else {
+                    None
+                };
+
+                let (_, rows) = adapter::run_adapter(client.as_ref(), &site, &name, args, 0)
+                    .await
+                    .map_err(|e| -> Box<dyn std::error::Error> { e.to_string().into() })?;
+                let report = health::validate(&ada, &rows);
+
+                match cli.format.as_str() {
+                    "json" => println!("{}", serde_json::to_string_pretty(&report)?),
+                    _ => {
+                        let symbol = match report.status {
+                            health::HealthStatus::Healthy => "pass",
+                            health::HealthStatus::Degraded => "warn",
+                            health::HealthStatus::Broken => "FAIL",
+                        };
+                        eprintln!("[{}] {}", symbol, report.adapter);
+                        for c in &report.checks {
+                            eprintln!(
+                                "  {} {}: {}",
+                                if c.passed { "+" } else { "-" },
+                                c.name,
+                                c.message
+                            );
+                        }
+                    }
+                }
+
+                if report.status == health::HealthStatus::Broken {
+                    std::process::exit(1);
+                }
             }
         }
 
@@ -788,9 +915,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         }
 
         Command::Login { site } => {
-            browser::ensure_chrome(cli.port, cli.headless).await?;
-            let ws_url = cdp::CdpClient::discover_ws_url(cli.port).await?;
-            let client = cdp::CdpClient::connect(&ws_url).await?;
+            let client = browser::connect_browser(cli.port, cli.headless).await?;
 
             let dirs = adapter::adapter_base_dirs();
             let refs: Vec<&str> = dirs.iter().map(|s| s.as_str()).collect();
@@ -817,13 +942,17 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
 
-            // Extract -f/--format from raw args (clap doesn't parse external subcommand flags)
+            // Extract -f/--format and --each from raw args (clap doesn't parse external subcommand flags)
             let mut format = cli.format.clone();
+            let mut each_arg: Option<String> = None;
             let mut filtered_args: Vec<String> = Vec::new();
             let mut i = 0;
             while i < raw_args.len() {
                 if (raw_args[i] == "-f" || raw_args[i] == "--format") && i + 1 < raw_args.len() {
                     format = raw_args[i + 1].clone();
+                    i += 2;
+                } else if raw_args[i] == "--each" && i + 1 < raw_args.len() {
+                    each_arg = Some(raw_args[i + 1].clone());
                     i += 2;
                 } else {
                     filtered_args.push(raw_args[i].clone());
@@ -845,9 +974,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 // Lua adapter
                 let cli_args = parse_adapter_args(&raw_args[2..]);
 
-                browser::ensure_chrome(cli.port, cli.headless).await?;
-                let ws_url = cdp::CdpClient::discover_ws_url(cli.port).await?;
-                let client = cdp::CdpClient::connect(&ws_url).await?;
+                let client = browser::connect_browser(cli.port, cli.headless).await?;
 
                 let (columns, rows) =
                     lua_adapter::execute_lua_adapter(&lua_path, client, cli_args, 0).await?;
@@ -869,28 +996,79 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                     args.insert(k, v);
                 }
 
+                // --each: split a comma-separated arg and run adapter multiple times
+                let batch_values: Vec<String> = if let Some(ref each_key) = each_arg {
+                    if let Some(val) = args.get(each_key) {
+                        val.as_str()
+                            .unwrap_or("")
+                            .split(',')
+                            .map(|s| s.trim().to_string())
+                            .filter(|s| !s.is_empty())
+                            .collect()
+                    } else {
+                        return Err(format!("--each '{}': arg not found", each_key).into());
+                    }
+                } else {
+                    vec![]
+                };
+
                 // Determine if browser is needed: explicit browser: true, inline Lua, or default (None = true for backward compat)
                 let needs_browser = ada.run.is_some() || ada.browser != Some(false);
 
-                if needs_browser {
-                    browser::ensure_chrome(cli.port, cli.headless).await?;
-                    let ws_url = cdp::CdpClient::discover_ws_url(cli.port).await?;
-                    let client = cdp::CdpClient::connect(&ws_url).await?;
-
-                    // run: Lua or pipeline: YAML
-                    if let Some(ref script) = ada.run {
-                        let rows =
-                            lua_adapter::execute_inline_lua(script, &ada.columns, client, args, 0)
-                                .await?;
-                        output::print_output(&ada.columns, &rows, &format)?;
-                    } else {
-                        let rows = pipeline::execute(&ada.pipeline, Some(&client), args, 0).await?;
-                        output::print_output(&ada.columns, &rows, &format)?;
-                    }
+                // Build list of arg sets: single run or batch (--each splits comma-separated values)
+                let arg_sets: Vec<HashMap<String, Value>> = if !batch_values.is_empty() {
+                    let each_key = each_arg.as_ref().unwrap();
+                    batch_values
+                        .iter()
+                        .map(|val| {
+                            let mut run_args = args.clone();
+                            run_args.insert(each_key.clone(), Value::String(val.clone()));
+                            run_args
+                        })
+                        .collect()
                 } else {
-                    // No browser needed - run pipeline without CDP connection
-                    let rows = pipeline::execute(&ada.pipeline, None, args, 0).await?;
-                    output::print_output(&ada.columns, &rows, &format)?;
+                    vec![args]
+                };
+
+                if needs_browser {
+                    let client = browser::connect_browser(cli.port, cli.headless).await?;
+
+                    let mut all_rows = Vec::new();
+                    for run_args in arg_sets {
+                        if batch_values.len() > 1 {
+                            if let Some(ref ek) = each_arg {
+                                eprintln!("  → {} = {}", ek, run_args[ek].as_str().unwrap_or(""));
+                            }
+                        }
+                        if let Some(ref script) = ada.run {
+                            let rows = lua_adapter::execute_inline_lua(
+                                script,
+                                &ada.columns,
+                                client.clone(),
+                                run_args,
+                                0,
+                            )
+                            .await?;
+                            all_rows.extend(rows);
+                        } else {
+                            let rows = pipeline::execute(&ada.pipeline, Some(&client), run_args, 0)
+                                .await?;
+                            all_rows.extend(rows);
+                        }
+                    }
+                    output::print_output(&ada.columns, &all_rows, &format)?;
+                } else {
+                    let mut all_rows = Vec::new();
+                    for run_args in arg_sets {
+                        if batch_values.len() > 1 {
+                            if let Some(ref ek) = each_arg {
+                                eprintln!("  → {} = {}", ek, run_args[ek].as_str().unwrap_or(""));
+                            }
+                        }
+                        let rows = pipeline::execute(&ada.pipeline, None, run_args, 0).await?;
+                        all_rows.extend(rows);
+                    }
+                    output::print_output(&ada.columns, &all_rows, &format)?;
                 }
             }
         }

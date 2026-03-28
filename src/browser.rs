@@ -1,6 +1,28 @@
 use std::path::PathBuf;
 use std::process::Command;
 
+use crate::cdp::CdpClient;
+
+/// Connect to a browser, trying (in order):
+/// 1. Chrome extension bridge (user's real browser, best fingerprint)
+/// 2. Existing Chrome on the given port
+/// 3. Launch a new Chrome instance
+pub async fn connect_browser(
+    port: u16,
+    headless: bool,
+) -> Result<CdpClient, Box<dyn std::error::Error>> {
+    // 1. Try extension bridge (zero anti-bot detection)
+    match crate::bridge::try_extension_bridge().await {
+        Ok(client) => return Ok(client),
+        Err(_) => {} // Extension not available, fall through
+    }
+
+    // 2. Fall back to direct CDP (self-launched or existing Chrome)
+    ensure_chrome(port, headless).await?;
+    let ws_url = CdpClient::discover_ws_url(port).await?;
+    CdpClient::connect(&ws_url).await
+}
+
 /// Build Chrome launch arguments.
 fn chrome_launch_args(port: u16, headless: bool, profile_dir: &std::path::Path) -> Vec<String> {
     let mut args = vec![

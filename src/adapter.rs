@@ -26,6 +26,12 @@ pub struct Adapter {
     pub last_forged: Option<String>,
     /// Who/what forged this adapter (e.g. "claude-opus-4", "human")
     pub forged_by: Option<String>,
+    /// Output schema: maps column name to expected type (int, string, float, url)
+    #[serde(default)]
+    pub schema: Option<HashMap<String, String>>,
+    /// Health contract: output quality assertions
+    #[serde(default)]
+    pub health: Option<HealthContract>,
 }
 
 /// Defines an argument with an optional type and default value.
@@ -35,6 +41,15 @@ pub struct ArgDef {
     #[serde(rename = "type")]
     pub arg_type: Option<String>,
     pub default: Option<serde_json::Value>,
+}
+
+/// Health contract: output quality assertions for a claw.
+#[derive(Debug, Deserialize, Clone, Default)]
+pub struct HealthContract {
+    /// Minimum number of rows the adapter must return.
+    pub min_rows: Option<usize>,
+    /// Columns that must have non-empty values in every row.
+    pub non_empty: Option<Vec<String>>,
 }
 
 /// A single step in the adapter pipeline.
@@ -1603,5 +1618,55 @@ pipeline:
             }
             _ => panic!("expected Navigate as first pipeline step"),
         }
+    }
+
+    #[test]
+    fn parse_adapter_with_health_contract() {
+        let yaml = r#"
+site: test
+name: health_test
+columns: [rank, title, hot]
+schema:
+  rank: int
+  title: string
+  hot: int
+health:
+  min_rows: 5
+  non_empty: [title]
+pipeline:
+  - fetch: https://example.com/api
+"#;
+        let adapter: Adapter = serde_yml::from_str(yaml).unwrap();
+        let health = adapter.health.unwrap();
+        assert_eq!(health.min_rows, Some(5));
+        assert_eq!(health.non_empty, Some(vec!["title".to_string()]));
+        let schema = adapter.schema.unwrap();
+        assert_eq!(schema.get("rank"), Some(&"int".to_string()));
+        assert_eq!(schema.get("title"), Some(&"string".to_string()));
+        assert_eq!(schema.get("hot"), Some(&"int".to_string()));
+    }
+
+    #[test]
+    fn parse_adapter_without_health_uses_defaults() {
+        let adapter: Adapter = serde_yml::from_str(BILIBILI_HOT_YAML).unwrap();
+        assert!(adapter.health.is_none());
+        assert!(adapter.schema.is_none());
+    }
+
+    #[test]
+    fn parse_health_partial_fields() {
+        let yaml = r#"
+site: test
+name: partial
+columns: [title]
+health:
+  min_rows: 3
+pipeline:
+  - fetch: https://example.com
+"#;
+        let adapter: Adapter = serde_yml::from_str(yaml).unwrap();
+        let health = adapter.health.unwrap();
+        assert_eq!(health.min_rows, Some(3));
+        assert!(health.non_empty.is_none());
     }
 }
