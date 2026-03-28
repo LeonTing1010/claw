@@ -1,17 +1,17 @@
 # Claw
 
-> **The universal API layer for the web.** Grab once, run forever.
+> **Make every website programmable by AI.**
 
 Websites are closing their APIs. AI agents need them more than ever. Claw bridges the gap.
 
-AI agents grab websites and turn them into **claws** — deterministic, machine-generated API specs that run with zero AI: no tokens, no latency, no drift.
+AI agents grab websites and turn them into **claws** — deterministic, machine-generated API specs that run with zero AI. One agent grabs a website, every agent benefits.
 
 ```
 AI agent ──grab──→ claw (YAML/Lua) ──run──→ structured data
          (once)                     (1000x, free)
 ```
 
-Single Rust binary. Zero dependencies. CDP-native precision that works on React/Vue/Angular SPAs.
+Single Rust binary. Zero dependencies. Works on any website including React/Vue/Angular SPAs.
 
 ## Install
 

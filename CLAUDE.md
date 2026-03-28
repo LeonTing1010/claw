@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-Claw is the **universal API layer for the web**. Websites are closing their APIs; AI agents need them more than ever. Claw bridges the gap — AI agents grab websites and turn them into deterministic claws (YAML/Lua), machine-generated API specs that run with zero AI at runtime. See `.claude/DESIGN.md` for full design.
+**Make every website programmable by AI.** Websites are closing their APIs; AI agents need them more than ever. Claw bridges the gap — AI agents grab websites and turn them into deterministic claws (YAML/Lua), machine-generated API specs that run with zero AI at runtime. One agent grabs a website, every agent benefits. See `.claude/DESIGN.md` for full design.
 
 ## Development Workflow
 

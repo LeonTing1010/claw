@@ -1374,8 +1374,9 @@ pipeline:
 site: reddit
 name: hot
 description: Reddit Hot Posts
+domain: reddit.com
 strategy: public
-browser: false
+browser: true
 version: "1"
 last_forged: "2026-03-28"
 forged_by: "claude-opus-4"
@@ -1388,21 +1389,24 @@ args:
 columns: [rank, title, subreddit, score]
 
 pipeline:
-  - fetch:
-      url: https://www.reddit.com/r/popular/hot.json?limit=50&raw_json=1
-      headers:
-        User-Agent: "Mozilla/5.0 (compatible; Claw/1.0)"
-  - select: data.children
-  - transform: |
-      local result = {}
-      for i, child in ipairs(data) do
-        local d = child.data or child
-        table.insert(result, {
-          rank = i, title = d.title or "",
-          subreddit = d.subreddit or "", score = d.score or 0
-        })
-      end
-      return result
+  - navigate: https://www.reddit.com/
+  - wait: 2
+  - evaluate: |
+      (async () => {
+        const res = await fetch('https://www.reddit.com/r/popular/hot.json?limit=50&raw_json=1');
+        const data = await res.json();
+        return data.data.children.map((child, i) => ({
+          rank: i + 1,
+          title: child.data.title,
+          subreddit: child.data.subreddit_name_prefixed || child.data.subreddit,
+          score: child.data.score || 0
+        }));
+      })()
+  - map:
+      rank: ${{ item.rank }}
+      title: ${{ item.title }}
+      subreddit: ${{ item.subreddit }}
+      score: ${{ item.score }}
   - limit: ${{ args.limit }}
 "#;
 
@@ -1412,15 +1416,14 @@ pipeline:
         assert_eq!(adapter.site, "reddit");
         assert_eq!(adapter.name, "hot");
         assert_eq!(adapter.strategy, Some("public".to_string()));
-        assert_eq!(adapter.browser, Some(false));
+        assert_eq!(adapter.browser, Some(true));
         assert_eq!(adapter.columns, vec!["rank", "title", "subreddit", "score"]);
-        // First step should be Fetch
+        // First step should be Navigate
         match &adapter.pipeline[0] {
-            PipelineStep::Fetch { url, .. } => {
+            PipelineStep::Navigate(url) => {
                 assert!(url.contains("reddit.com"));
-                assert!(url.contains(".json"));
             }
-            _ => panic!("expected Fetch as first pipeline step"),
+            _ => panic!("expected Navigate as first pipeline step"),
         }
     }
 

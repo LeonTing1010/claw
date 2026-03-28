@@ -17,7 +17,7 @@ use serde_json::Value;
 #[derive(Parser)]
 #[command(
     name = "claw",
-    about = "The universal API layer for the web — grab once, run forever"
+    about = "Make every website programmable by AI"
 )]
 #[command(allow_external_subcommands = true)]
 struct Cli {
