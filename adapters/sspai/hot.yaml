@@ -1,0 +1,34 @@
+site: sspai
+name: hot
+description: 少数派热门文章
+domain: sspai.com
+strategy: public
+browser: true
+version: "1"
+last_forged: "2026-03-28"
+forged_by: "claude-opus-4"
+
+args:
+  limit:
+    type: int
+    default: 20
+
+columns: [title, likes, author]
+
+pipeline:
+  - navigate: https://sspai.com
+  - evaluate: |
+      (async () => {
+        const res = await fetch('https://sspai.com/api/v1/articles?offset=0&limit=50&sort=hottest_daily');
+        const data = await res.json();
+        return (data.list || data.data || []).map(a => ({
+          title: a.title,
+          likes: a.like_count || a.likes || 0,
+          author: a.author?.nickname || a.nickname || '-'
+        }));
+      })()
+  - map:
+      title: ${{ item.title }}
+      likes: ${{ item.likes }}
+      author: ${{ item.author }}
+  - limit: ${{ args.limit }}

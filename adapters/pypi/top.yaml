@@ -1,0 +1,23 @@
+site: pypi
+name: top
+description: "PyPI 热门 Python 包"
+strategy: public
+browser: false
+version: "1"
+last_forged: "2026-03-28"
+forged_by: "claw-forge"
+
+args:
+  limit:
+    type: int
+    default: 20
+
+columns: [project, download_count]
+
+pipeline:
+  - fetch: https://hugovk.github.io/top-pypi-packages/top-pypi-packages-30-days.min.json
+  - select: rows
+  - map:
+      project: ${{ item.project }}
+      download_count: ${{ item.download_count }}
+  - limit: ${{ args.limit }}

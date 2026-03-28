@@ -15,10 +15,7 @@ use clap_complete::{generate, Shell};
 use serde_json::Value;
 
 #[derive(Parser)]
-#[command(
-    name = "claw",
-    about = "Make every website programmable by AI"
-)]
+#[command(name = "claw", about = "Make every website programmable by AI")]
 #[command(allow_external_subcommands = true)]
 struct Cli {
     /// Chrome CDP debugging port
@@ -259,8 +256,8 @@ enum Command {
         name: String,
     },
 
-    /// Auto-generate a claw YAML from minimal inputs
-    Forge {
+    /// Grab a website — auto-generate a claw from an API URL
+    Grab {
         /// Site name (becomes directory under adapters/)
         #[arg(long)]
         site: String,
@@ -767,7 +764,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             println!("rolled back {}/{} from {}", site, name, backup);
         }
 
-        Command::Forge {
+        Command::Grab {
             site,
             name,
             description,

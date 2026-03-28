@@ -1,0 +1,34 @@
+site: crates
+name: popular
+description: crates.io 热门 Rust 包
+domain: crates.io
+strategy: public
+browser: true
+version: "1"
+last_forged: "2026-03-28"
+forged_by: "claude-opus-4"
+
+args:
+  limit:
+    type: int
+    default: 20
+
+columns: [name, downloads, description]
+
+pipeline:
+  - navigate: https://crates.io
+  - evaluate: |
+      (async () => {
+        const res = await fetch('/api/v1/crates?page=1&per_page=50&sort=downloads');
+        const data = await res.json();
+        return data.crates.map(c => ({
+          name: c.name,
+          downloads: c.downloads,
+          description: (c.description || '').substring(0, 60)
+        }));
+      })()
+  - map:
+      name: ${{ item.name }}
+      downloads: ${{ item.downloads }}
+      description: ${{ item.description }}
+  - limit: ${{ args.limit }}

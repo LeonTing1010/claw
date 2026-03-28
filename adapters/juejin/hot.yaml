@@ -1,0 +1,38 @@
+site: juejin
+name: hot
+description: 掘金热门文章
+domain: juejin.cn
+strategy: public
+browser: true
+version: "1"
+last_forged: "2026-03-28"
+forged_by: "claude-opus-4"
+
+args:
+  limit:
+    type: int
+    default: 20
+
+columns: [title, views, author]
+
+pipeline:
+  - navigate: https://juejin.cn
+  - evaluate: |
+      (async () => {
+        const res = await fetch('https://api.juejin.cn/content_api/v1/content/article_rank?category_id=1&type=hot&count=50', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: '{}'
+        });
+        const data = await res.json();
+        return (data.data || []).map(item => ({
+          title: item.content.title,
+          views: item.content.display_count || 0,
+          author: item.author.name || '-'
+        }));
+      })()
+  - map:
+      title: ${{ item.title }}
+      views: ${{ item.views }}
+      author: ${{ item.author }}
+  - limit: ${{ args.limit }}

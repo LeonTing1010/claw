@@ -1,0 +1,25 @@
+site: obsidian
+name: notes
+description: Obsidian vault 笔记列表（需 --port 9225 启动 Obsidian）
+domain: obsidian.md
+strategy: public
+browser: true
+version: "1"
+last_forged: "2026-03-28"
+forged_by: "claude-opus-4"
+
+args:
+  limit:
+    type: int
+    default: 50
+
+columns: [title]
+
+pipeline:
+  - evaluate: |
+      Array.from(document.querySelectorAll('.tree-item-inner'))
+        .map(el => ({ title: el.textContent.trim() }))
+        .filter(item => item.title.length > 0)
+  - map:
+      title: ${{ item.title }}
+  - limit: ${{ args.limit }}

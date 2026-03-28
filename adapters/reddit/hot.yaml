@@ -2,7 +2,7 @@ site: reddit
 name: hot
 description: Reddit Hot Posts
 domain: reddit.com
-strategy: public
+strategy: cookie
 browser: true
 version: "1"
 last_forged: "2026-03-28"

@@ -2,7 +2,7 @@ site: instagram
 name: explore
 description: Instagram Explore
 domain: instagram.com
-strategy: intercept
+strategy: cookie
 browser: true
 version: "1"
 last_forged: "2026-03-28"
@@ -16,43 +16,33 @@ args:
 columns: [rank, caption, author, likes]
 
 pipeline:
-  - intercept:
-      trigger: "navigate: https://www.instagram.com/explore/"
-      capture: "/graphql/query"
-      timeout: 15
-  - transform: |
-      local items = {}
-      local function extract(obj)
-        if type(obj) ~= "table" then return end
-        if obj.shortcode and (obj.edge_media_preview_like or obj.like_count) then
-          table.insert(items, obj)
-          return
-        end
-        for _, v in pairs(obj) do
-          if type(v) == "table" then extract(v) end
-        end
-      end
-      extract(data)
-      local result = {}
-      for i, media in ipairs(items) do
-        local caption = ""
-        if media.edge_media_to_caption and media.edge_media_to_caption.edges
-           and #media.edge_media_to_caption.edges > 0 then
-          caption = media.edge_media_to_caption.edges[1].node.text or ""
-        elseif media.caption and media.caption.text then
-          caption = media.caption.text
-        end
-        local likes = 0
-        if media.edge_media_preview_like then
-          likes = media.edge_media_preview_like.count or 0
-        elseif media.like_count then
-          likes = media.like_count
-        end
-        table.insert(result, {
-          rank = i, caption = string.sub(caption, 1, 200),
-          author = (media.owner or {}).username or "",
-          likes = likes
-        })
-      end
-      return result
+  - navigate: https://www.instagram.com/explore/
+  - wait: 5
+  - evaluate: |
+      (() => {
+        const items = [];
+        const posts = document.querySelectorAll('a[href*="/p/"], a[href*="/reel/"]');
+        const seen = new Set();
+        for (const a of posts) {
+          const href = a.href;
+          if (seen.has(href)) continue;
+          seen.add(href);
+          const img = a.querySelector('img');
+          const caption = img ? (img.alt || '').trim() : '';
+          const likeEl = a.querySelector('[class*="like"], span');
+          const likes = likeEl ? likeEl.textContent.trim() : '0';
+          items.push({
+            rank: items.length + 1,
+            caption: caption.substring(0, 200),
+            author: '',
+            likes: likes
+          });
+        }
+        return items;
+      })()
+  - map:
+      rank: ${{ item.rank }}
+      caption: ${{ item.caption }}
+      author: ${{ item.author }}
+      likes: ${{ item.likes }}
   - limit: ${{ args.limit }}

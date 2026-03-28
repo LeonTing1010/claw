@@ -1,0 +1,37 @@
+site: wikipedia
+name: most-read
+description: Wikipedia 每日最多阅读
+domain: en.wikipedia.org
+strategy: public
+browser: true
+version: "1"
+last_forged: "2026-03-28"
+forged_by: "claude-opus-4"
+
+args:
+  limit:
+    type: int
+    default: 20
+
+columns: [title, description, views]
+
+pipeline:
+  - navigate: https://en.wikipedia.org
+  - evaluate: |
+      (async () => {
+        const d = new Date();
+        const y = d.getFullYear(), m = d.getMonth() + 1, day = d.getDate() - 1;
+        const url = `https://en.wikipedia.org/api/rest_v1/feed/featured/${y}/${String(m).padStart(2,'0')}/${String(day).padStart(2,'0')}`;
+        const res = await fetch(url);
+        const data = await res.json();
+        return (data.mostread?.articles || []).map(a => ({
+          title: a.titles?.normalized || a.title,
+          description: a.description || '-',
+          views: a.views || 0
+        }));
+      })()
+  - map:
+      title: ${{ item.title }}
+      description: ${{ item.description }}
+      views: ${{ item.views }}
+  - limit: ${{ args.limit }}

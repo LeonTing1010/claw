@@ -2,7 +2,7 @@ site: facebook
 name: feed
 description: Facebook News Feed
 domain: facebook.com
-strategy: intercept
+strategy: cookie
 browser: true
 version: "1"
 last_forged: "2026-03-28"
@@ -16,37 +16,32 @@ args:
 columns: [rank, author, text, url]
 
 pipeline:
-  - intercept:
-      trigger: "navigate: https://www.facebook.com/"
-      capture: "/api/graphql"
-      timeout: 15
-  - transform: |
-      local items = {}
-      local function extract(obj)
-        if type(obj) ~= "table" then return end
-        if obj.__typename == "Story" and obj.message then
-          table.insert(items, obj)
-          return
-        end
-        for _, v in pairs(obj) do
-          if type(v) == "table" then extract(v) end
-        end
-      end
-      extract(data)
-      local result = {}
-      for i, story in ipairs(items) do
-        local text = ""
-        if story.message and story.message.text then
-          text = story.message.text
-        end
-        local author = ""
-        if story.actors and #story.actors > 0 then
-          author = story.actors[1].name or ""
-        end
-        table.insert(result, {
-          rank = i, author = author,
-          text = string.sub(text, 1, 200), url = story.url or ""
-        })
-      end
-      return result
+  - navigate: https://www.facebook.com/
+  - wait: 5
+  - evaluate: |
+      (() => {
+        const items = [];
+        const articles = document.querySelectorAll('[role="article"]');
+        articles.forEach((el, i) => {
+          const authorEl = el.querySelector('h3 a, h4 a, [data-ad-preview="headline"] a, strong a');
+          const author = authorEl ? authorEl.textContent.trim() : '';
+          const textEls = el.querySelectorAll('[dir="auto"]');
+          let text = '';
+          for (const t of textEls) {
+            const content = t.textContent.trim();
+            if (content.length > text.length && content.length < 500) text = content;
+          }
+          const linkEl = el.querySelector('a[href*="/posts/"], a[href*="/photos/"], a[href*="/videos/"], a[href*="permalink"]');
+          const url = linkEl ? linkEl.href : '';
+          if (author || text) {
+            items.push({ rank: i + 1, author, text: text.substring(0, 200), url });
+          }
+        });
+        return items;
+      })()
+  - map:
+      rank: ${{ item.rank }}
+      author: ${{ item.author }}
+      text: ${{ item.text }}
+      url: ${{ item.url }}
   - limit: ${{ args.limit }}

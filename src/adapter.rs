@@ -1375,7 +1375,7 @@ site: reddit
 name: hot
 description: Reddit Hot Posts
 domain: reddit.com
-strategy: public
+strategy: cookie
 browser: true
 version: "1"
 last_forged: "2026-03-28"
@@ -1415,7 +1415,7 @@ pipeline:
         let adapter: Adapter = serde_yml::from_str(REDDIT_HOT_YAML).unwrap();
         assert_eq!(adapter.site, "reddit");
         assert_eq!(adapter.name, "hot");
-        assert_eq!(adapter.strategy, Some("public".to_string()));
+        assert_eq!(adapter.strategy, Some("cookie".to_string()));
         assert_eq!(adapter.browser, Some(true));
         assert_eq!(adapter.columns, vec!["rank", "title", "subreddit", "score"]);
         // First step should be Navigate
@@ -1432,7 +1432,7 @@ site: tiktok
 name: trending
 description: TikTok Trending Videos
 domain: tiktok.com
-strategy: intercept
+strategy: cookie
 browser: true
 version: "1"
 last_forged: "2026-03-28"
@@ -1443,25 +1443,32 @@ args:
     type: int
     default: 20
 
-columns: [rank, title, author, plays]
+columns: [rank, author, views, url]
 
 pipeline:
-  - intercept:
-      trigger: "navigate: https://www.tiktok.com/explore"
-      capture: "/api/recommend/item_list"
-      timeout: 15
-      select: itemList
-  - transform: |
-      local result = {}
-      for i, item in ipairs(data) do
-        table.insert(result, {
-          rank = i,
-          title = item.desc or "",
-          author = (item.author or {}).uniqueId or "",
-          plays = (item.stats or {}).playCount or 0
-        })
-      end
-      return result
+  - navigate: https://www.tiktok.com/explore
+  - wait: 5
+  - evaluate: |
+      (() => {
+        const links = document.querySelectorAll('a[href*="/video/"]');
+        const items = [];
+        const seen = new Set();
+        for (const a of links) {
+          const href = a.href;
+          if (seen.has(href)) continue;
+          seen.add(href);
+          const match = href.match(/@([^/]+)/);
+          const author = match ? match[1] : '';
+          const views = a.textContent.trim();
+          items.push({ rank: items.length + 1, author, views: views || '0', url: href });
+        }
+        return items;
+      })()
+  - map:
+      rank: ${{ item.rank }}
+      author: ${{ item.author }}
+      views: ${{ item.views }}
+      url: ${{ item.url }}
   - limit: ${{ args.limit }}
 "#;
 
@@ -1470,18 +1477,14 @@ pipeline:
         let adapter: Adapter = serde_yml::from_str(TIKTOK_TRENDING_YAML).unwrap();
         assert_eq!(adapter.site, "tiktok");
         assert_eq!(adapter.name, "trending");
-        assert_eq!(adapter.strategy, Some("intercept".to_string()));
+        assert_eq!(adapter.strategy, Some("cookie".to_string()));
         assert_eq!(adapter.browser, Some(true));
-        assert_eq!(adapter.columns, vec!["rank", "title", "author", "plays"]);
-        // First step should be Intercept
+        assert_eq!(adapter.columns, vec!["rank", "author", "views", "url"]);
         match &adapter.pipeline[0] {
-            PipelineStep::Intercept {
-                trigger, capture, ..
-            } => {
-                assert!(trigger.contains("tiktok.com/explore"));
-                assert!(capture.contains("item_list"));
+            PipelineStep::Navigate(url) => {
+                assert!(url.contains("tiktok.com/explore"));
             }
-            _ => panic!("expected Intercept as first pipeline step"),
+            _ => panic!("expected Navigate as first pipeline step"),
         }
     }
 
@@ -1490,7 +1493,7 @@ site: facebook
 name: feed
 description: Facebook News Feed
 domain: facebook.com
-strategy: intercept
+strategy: cookie
 browser: true
 version: "1"
 last_forged: "2026-03-28"
@@ -1504,39 +1507,26 @@ args:
 columns: [rank, author, text, url]
 
 pipeline:
-  - intercept:
-      trigger: "navigate: https://www.facebook.com/"
-      capture: "/api/graphql"
-      timeout: 15
-  - transform: |
-      local items = {}
-      local function extract(obj)
-        if type(obj) ~= "table" then return end
-        if obj.__typename == "Story" and obj.message then
-          table.insert(items, obj)
-          return
-        end
-        for _, v in pairs(obj) do
-          if type(v) == "table" then extract(v) end
-        end
-      end
-      extract(data)
-      local result = {}
-      for i, story in ipairs(items) do
-        local text = ""
-        if story.message and story.message.text then
-          text = story.message.text
-        end
-        local author = ""
-        if story.actors and #story.actors > 0 then
-          author = story.actors[1].name or ""
-        end
-        table.insert(result, {
-          rank = i, author = author,
-          text = string.sub(text, 1, 200), url = story.url or ""
-        })
-      end
-      return result
+  - navigate: https://www.facebook.com/
+  - wait: 5
+  - evaluate: |
+      (() => {
+        const items = [];
+        const articles = document.querySelectorAll('[role="article"]');
+        articles.forEach((el, i) => {
+          const authorEl = el.querySelector('h3 a, h4 a, strong a');
+          const author = authorEl ? authorEl.textContent.trim() : '';
+          if (author || el.textContent.length > 10) {
+            items.push({ rank: i + 1, author, text: '', url: '' });
+          }
+        });
+        return items;
+      })()
+  - map:
+      rank: ${{ item.rank }}
+      author: ${{ item.author }}
+      text: ${{ item.text }}
+      url: ${{ item.url }}
   - limit: ${{ args.limit }}
 "#;
 
@@ -1545,17 +1535,14 @@ pipeline:
         let adapter: Adapter = serde_yml::from_str(FACEBOOK_FEED_YAML).unwrap();
         assert_eq!(adapter.site, "facebook");
         assert_eq!(adapter.name, "feed");
-        assert_eq!(adapter.strategy, Some("intercept".to_string()));
+        assert_eq!(adapter.strategy, Some("cookie".to_string()));
         assert_eq!(adapter.browser, Some(true));
         assert_eq!(adapter.columns, vec!["rank", "author", "text", "url"]);
         match &adapter.pipeline[0] {
-            PipelineStep::Intercept {
-                trigger, capture, ..
-            } => {
-                assert!(trigger.contains("facebook.com"));
-                assert!(capture.contains("graphql"));
+            PipelineStep::Navigate(url) => {
+                assert!(url.contains("facebook.com"));
             }
-            _ => panic!("expected Intercept as first pipeline step"),
+            _ => panic!("expected Navigate as first pipeline step"),
         }
     }
 
@@ -1564,7 +1551,7 @@ site: instagram
 name: explore
 description: Instagram Explore
 domain: instagram.com
-strategy: intercept
+strategy: cookie
 browser: true
 version: "1"
 last_forged: "2026-03-28"
@@ -1578,45 +1565,27 @@ args:
 columns: [rank, caption, author, likes]
 
 pipeline:
-  - intercept:
-      trigger: "navigate: https://www.instagram.com/explore/"
-      capture: "/graphql/query"
-      timeout: 15
-  - transform: |
-      local items = {}
-      local function extract(obj)
-        if type(obj) ~= "table" then return end
-        if obj.shortcode and (obj.edge_media_preview_like or obj.like_count) then
-          table.insert(items, obj)
-          return
-        end
-        for _, v in pairs(obj) do
-          if type(v) == "table" then extract(v) end
-        end
-      end
-      extract(data)
-      local result = {}
-      for i, media in ipairs(items) do
-        local caption = ""
-        if media.edge_media_to_caption and media.edge_media_to_caption.edges
-           and #media.edge_media_to_caption.edges > 0 then
-          caption = media.edge_media_to_caption.edges[1].node.text or ""
-        elseif media.caption and media.caption.text then
-          caption = media.caption.text
-        end
-        local likes = 0
-        if media.edge_media_preview_like then
-          likes = media.edge_media_preview_like.count or 0
-        elseif media.like_count then
-          likes = media.like_count
-        end
-        table.insert(result, {
-          rank = i, caption = string.sub(caption, 1, 200),
-          author = (media.owner or {}).username or "",
-          likes = likes
-        })
-      end
-      return result
+  - navigate: https://www.instagram.com/explore/
+  - wait: 5
+  - evaluate: |
+      (() => {
+        const items = [];
+        const posts = document.querySelectorAll('a[href*="/p/"], a[href*="/reel/"]');
+        const seen = new Set();
+        for (const a of posts) {
+          if (seen.has(a.href)) continue;
+          seen.add(a.href);
+          const img = a.querySelector('img');
+          const caption = img ? (img.alt || '') : '';
+          items.push({ rank: items.length + 1, caption: caption.substring(0, 200), author: '', likes: '0' });
+        }
+        return items;
+      })()
+  - map:
+      rank: ${{ item.rank }}
+      caption: ${{ item.caption }}
+      author: ${{ item.author }}
+      likes: ${{ item.likes }}
   - limit: ${{ args.limit }}
 "#;
 
@@ -1625,17 +1594,14 @@ pipeline:
         let adapter: Adapter = serde_yml::from_str(INSTAGRAM_EXPLORE_YAML).unwrap();
         assert_eq!(adapter.site, "instagram");
         assert_eq!(adapter.name, "explore");
-        assert_eq!(adapter.strategy, Some("intercept".to_string()));
+        assert_eq!(adapter.strategy, Some("cookie".to_string()));
         assert_eq!(adapter.browser, Some(true));
         assert_eq!(adapter.columns, vec!["rank", "caption", "author", "likes"]);
         match &adapter.pipeline[0] {
-            PipelineStep::Intercept {
-                trigger, capture, ..
-            } => {
-                assert!(trigger.contains("instagram.com/explore"));
-                assert!(capture.contains("graphql"));
+            PipelineStep::Navigate(url) => {
+                assert!(url.contains("instagram.com/explore"));
             }
-            _ => panic!("expected Intercept as first pipeline step"),
+            _ => panic!("expected Navigate as first pipeline step"),
         }
     }
 }
