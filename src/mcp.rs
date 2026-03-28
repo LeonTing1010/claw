@@ -649,200 +649,49 @@ async fn handle_tool_call(id: &Value, params: &Value, client: &BridgeClient) -> 
     }
 }
 
+/// Route an MCP tool call to the extension bridge.
+///
+/// Most tools relay directly as CDP commands via `client.send()`.
+/// A few (forge_verify, forge_save, list_adapters) have local logic.
 async fn execute_tool(
     name: &str,
     args: &Value,
     client: &BridgeClient,
 ) -> Result<Value, Box<dyn std::error::Error>> {
     match name {
-        "screenshot" => {
-            let path = args["path"].as_str().unwrap_or("/tmp/claw-screenshot.png");
-            let full = args["full_page"].as_bool().unwrap_or(false);
-            if full {
-                client.screenshot_full(path).await?;
-            } else {
-                client.screenshot(path).await?;
-            }
-            Ok(json!(path))
-        }
-        "navigate" => {
-            let url = args["url"].as_str().ok_or("missing url")?;
-            client.navigate(url).await?;
-            Ok(json!(format!("navigated to {}", url)))
-        }
-        "ax_tree" => {
-            let depth = args["depth"].as_i64().map(|d| d as i32);
-            client.get_ax_tree(depth).await
-        }
-        "read_dom" => {
-            let selector = args["selector"].as_str();
-            let depth = args["depth"].as_i64().unwrap_or(10) as i32;
-            client.get_dom_tree(selector, depth).await
-        }
-        "page_info" => client.get_page_info().await,
-        "find" => {
-            let query = args["query"].as_str().ok_or("missing query")?;
-            let role = args["role"].as_str();
-            client.find_elements(query, role).await
-        }
-        "element_info" => {
-            let selector = args["selector"].as_str().ok_or("missing selector")?;
-            client.get_element_info(selector).await
-        }
-        "click" => {
-            let text = args["text"].as_str().ok_or("missing text")?;
-            client.click_text(text).await?;
-            Ok(json!(format!("clicked \"{}\"", text)))
-        }
-        "click_selector" => {
-            let selector = args["selector"].as_str().ok_or("missing selector")?;
-            client.click_selector(selector).await?;
-            Ok(json!(format!("clicked {}", selector)))
-        }
-        "type_text" => {
-            let selector = args["selector"].as_str().ok_or("missing selector")?;
-            let text = args["text"].as_str().ok_or("missing text")?;
-            client.type_into(selector, text).await?;
-            Ok(json!(format!("typed into {}", selector)))
-        }
-        "hover" => {
-            let selector = args["selector"].as_str().ok_or("missing selector")?;
-            client.hover_selector(selector).await?;
-            Ok(json!(format!("hovered {}", selector)))
-        }
-        "scroll" => {
-            let selector = args["selector"].as_str().ok_or("missing selector")?;
-            client.scroll_into_view(selector).await?;
-            Ok(json!(format!("scrolled to {}", selector)))
-        }
-        "press_key" => {
-            let key = args["key"].as_str().ok_or("missing key")?;
-            let modifiers = args["modifiers"].as_u64().unwrap_or(0) as u32;
-            client.press_key(key, modifiers).await?;
-            Ok(json!(format!("pressed {}", key)))
-        }
-        "select" => {
-            let selector = args["selector"].as_str().ok_or("missing selector")?;
-            let value = args["value"].as_str().ok_or("missing value")?;
-            client.select_option(selector, value).await?;
-            Ok(json!(format!("selected {} = {}", selector, value)))
-        }
-        "upload" => {
-            let selector = args["selector"].as_str().ok_or("missing selector")?;
-            let files_str = args["files"].as_str().ok_or("missing files")?;
-            let paths: Vec<&str> = files_str.split(',').map(|s| s.trim()).collect();
-            client.upload_files(selector, &paths).await?;
-            Ok(json!(format!("uploaded to {}", selector)))
-        }
-        "evaluate" => {
-            let expr = args["expression"].as_str().ok_or("missing expression")?;
-            client.evaluate(expr).await
-        }
-        "cookies" => client.get_cookies().await,
-        "hit_test" => {
-            let x = args["x"].as_f64().ok_or("missing x")?;
-            let y = args["y"].as_f64().ok_or("missing y")?;
-            client.hit_test(x, y).await
-        }
-        "top_layer" => client.get_top_layer().await,
-        "event_listeners" => {
-            let selector = args["selector"].as_str().ok_or("missing selector")?;
-            client.get_event_listeners(selector).await
-        }
-        "network_log_start" => {
-            client.start_network_log().await?;
-            Ok(json!("network capture started (CDP Network domain)"))
-        }
-        "network_log_dump" => client.get_network_log().await,
-        "network_log_dump_bodies" => {
-            let url_filter = args["url_filter"].as_str();
-            client.get_network_log_with_bodies(url_filter).await
-        }
-        "dismiss_dialog" => {
-            let accept = args["accept"].as_bool().unwrap_or(true);
-            let prompt_text = args["prompt_text"].as_str();
-            client.dismiss_dialog(accept, prompt_text).await?;
-            Ok(json!(if accept { "accepted" } else { "dismissed" }))
-        }
-        "force_state" => {
-            let selector = args["selector"].as_str().ok_or("missing selector")?;
-            let states: Vec<&str> = args["states"]
-                .as_array()
-                .map(|a| a.iter().filter_map(|v| v.as_str()).collect())
-                .unwrap_or_default();
-            client.force_pseudo_state(selector, &states).await?;
-            Ok(json!(format!("forced {:?} on {}", states, selector)))
-        }
-        "download" => {
-            let url = args["url"].as_str().ok_or("missing url")?;
-            let output = args["output"].as_str().ok_or("missing output")?;
-            let size = client.download_via_browser(url, output).await?;
-            Ok(json!(format!("{} ({} bytes)", output, size)))
-        }
-        "save_image" => {
-            let selector = args["selector"].as_str().ok_or("missing selector")?;
-            let output = args["output"].as_str().ok_or("missing output")?;
-            client.save_image(selector, output).await
-        }
+        // --- Tools with local logic ---
+
         "page_intelligence" => {
-            // Navigate first if URL provided
             if let Some(url) = args["url"].as_str() {
                 client.navigate(url).await?;
             }
-            // Relay to extension — gathers framework, SSR state, APIs, interactive, auth in one call
-            let result = client
-                .send("Claw.pageIntelligence", Some(json!({})))
-                .await?;
-            Ok(result)
+            client.send("Claw.pageIntelligence", Some(json!({}))).await
         }
         "list_adapters" => {
             let base_dirs = crate::adapter::adapter_base_dirs();
             let refs: Vec<&str> = base_dirs.iter().map(|s| s.as_str()).collect();
             let adapters = crate::adapter::list_adapters(&refs);
-            let list: Vec<Value> = adapters
-                .iter()
-                .map(|a| {
-                    json!({
-                        "site": a.site,
-                        "name": a.name,
-                        "description": a.description,
-                        "strategy": a.strategy
-                    })
-                })
-                .collect();
-            Ok(json!(list))
+            Ok(json!(adapters.iter().map(|a| json!({
+                "site": a.site, "name": a.name,
+                "description": a.description, "strategy": a.strategy
+            })).collect::<Vec<_>>()))
         }
         "run_adapter" => {
             let site = args["site"].as_str().ok_or("missing site")?;
-            let name = args["name"].as_str().ok_or("missing name")?;
+            let name_arg = args["name"].as_str().ok_or("missing name")?;
             let adapter_args = args.get("args").cloned().unwrap_or(json!({}));
-
-            // Relay to Chrome extension via bridge
             let mut result = client
-                .send(
-                    "Claw.run",
-                    Some(json!({
-                        "site": site,
-                        "name": name,
-                        "args": adapter_args
-                    })),
-                )
+                .send("Claw.run", Some(json!({"site": site, "name": name_arg, "args": adapter_args})))
                 .await?;
-
-            // Health validation: if the result contains rows and a health contract, validate
+            // Health validation
             if let Some(rows) = result.get("rows").and_then(|r| r.as_array()) {
-                if let Some(health_val) = result.get("health") {
-                    if let Some(contract) = crate::adapter::parse_health_contract(health_val) {
-                        let adapter_name = format!("{}/{}", site, name);
-                        let report = crate::health::validate(&adapter_name, &contract, rows);
-                        result["health_report"] = serde_json::to_value(&report).unwrap_or_default();
-                    }
+                if let Some(contract) = result.get("health").and_then(crate::adapter::parse_health_contract) {
+                    let report = crate::health::validate(&format!("{}/{}", site, name_arg), &contract, rows);
+                    result["health_report"] = serde_json::to_value(&report).unwrap_or_default();
                 }
             }
-
             Ok(result)
         }
-        // ===== FORGE — Claw Creation Pipeline =====
         "forge_verify" => {
             let url = args["url"].as_str().ok_or("missing url")?;
             let wait_ms = args["wait_ms"].as_u64().unwrap_or(2000);
@@ -853,22 +702,14 @@ async fn execute_tool(
                 .unwrap_or_default();
 
             let start = std::time::Instant::now();
-
-            // Navigate
             client.navigate(url).await?;
-
-            // Wait
             if wait_ms > 0 {
                 tokio::time::sleep(std::time::Duration::from_millis(wait_ms)).await;
             }
-
-            // Evaluate
             let result = client.evaluate(expression).await?;
             let duration_ms = start.elapsed().as_millis();
 
-            // Validate
             let mut diagnostics = Vec::new();
-
             let rows = result.as_array();
             let row_count = rows.map(|r| r.len()).unwrap_or(0);
 
@@ -878,133 +719,99 @@ async fn execute_tool(
                 diagnostics.push("WARN: expression returned empty array".to_string());
             } else {
                 diagnostics.push(format!("OK: {} rows returned", row_count));
-
-                // Check columns against first row
                 if !columns.is_empty() {
-                    if let Some(first_row) = rows.unwrap().first() {
-                        if let Some(obj) = first_row.as_object() {
-                            let actual_keys: Vec<&str> = obj.keys().map(|k| k.as_str()).collect();
-                            let missing: Vec<&&str> = columns.iter()
-                                .filter(|c| !actual_keys.contains(*c))
-                                .collect();
-                            let extra: Vec<&&str> = actual_keys.iter()
-                                .filter(|k| !columns.contains(*k))
-                                .collect();
-                            if missing.is_empty() {
-                                diagnostics.push(format!("OK: all {} columns present", columns.len()));
-                            } else {
-                                diagnostics.push(format!("FAIL: missing columns: {:?}", missing));
-                            }
-                            if !extra.is_empty() {
-                                diagnostics.push(format!("INFO: extra fields: {:?}", extra));
-                            }
+                    if let Some(obj) = rows.unwrap().first().and_then(|r| r.as_object()) {
+                        let actual: Vec<&str> = obj.keys().map(|k| k.as_str()).collect();
+                        let missing: Vec<_> = columns.iter().filter(|c| !actual.contains(*c)).collect();
+                        if missing.is_empty() {
+                            diagnostics.push(format!("OK: all {} columns present", columns.len()));
                         } else {
-                            diagnostics.push("FAIL: first row is not an object".to_string());
+                            diagnostics.push(format!("FAIL: missing columns: {:?}", missing));
                         }
                     }
                 }
             }
 
-            let sample = rows
-                .map(|r| r.iter().take(5).cloned().collect::<Vec<_>>())
-                .unwrap_or_default();
-
             Ok(json!({
                 "status": if diagnostics.iter().any(|d| d.starts_with("FAIL")) { "fail" } else { "pass" },
                 "row_count": row_count,
                 "duration_ms": duration_ms,
-                "sample": sample,
+                "sample": rows.map(|r| r.iter().take(5).cloned().collect::<Vec<_>>()).unwrap_or_default(),
                 "diagnostics": diagnostics
             }))
         }
         "forge_save" => {
             let site = args["site"].as_str().ok_or("missing site")?;
-            let name = args["name"].as_str().ok_or("missing name")?;
+            let claw_name = args["name"].as_str().ok_or("missing name")?;
             let code = args["code"].as_str().ok_or("missing code")?;
-
             let home = std::env::var("HOME").unwrap_or_default();
             let dir = format!("{}/.claw/claws/{}", home, site);
             std::fs::create_dir_all(&dir)?;
-
-            let path = format!("{}/{}.claw.js", dir, name);
+            let path = format!("{}/{}.claw.js", dir, claw_name);
             std::fs::write(&path, code)?;
-
             Ok(json!(format!("saved to {}", path)))
         }
-        // ===== FORGE — Agent's Scalpels (Deep Inspection) =====
-        "api_log" => {
-            let clear = args["clear"].as_bool().unwrap_or(false);
-            let log = client.get_api_log().await?;
-            if clear {
-                client.clear_api_log().await?;
-            }
-            Ok(log)
+
+        // --- CDP relay tools — forward directly to extension ---
+
+        "navigate" => {
+            client.navigate(args["url"].as_str().ok_or("missing url")?).await?;
+            Ok(json!("navigated"))
         }
-        "global_names" => client.get_global_names().await,
-        "resource_tree" => client.get_resource_tree().await,
-        "resource_content" => {
-            let url = args["url"].as_str().ok_or("missing url")?;
-            client.get_resource_content(url).await
+        "evaluate" => {
+            client.evaluate(args["expression"].as_str().ok_or("missing expression")?).await
         }
-        "search_resource" => {
-            let query = args["query"].as_str().ok_or("missing query")?;
-            client.search_resources(query).await
-        }
-        "request_replay" => {
-            let url = args["url"].as_str().ok_or("missing url")?;
-            let method = args["method"].as_str().unwrap_or("GET");
-            let headers = args.get("headers").filter(|v| !v.is_null());
-            let body = args["body"].as_str();
-            client.request_replay(url, method, headers, body).await
-        }
-        "storage_items" => {
-            let storage_type = args["type"].as_str().unwrap_or("local");
-            client.get_storage_items(storage_type).await
-        }
-        // ===== INTERCEPT — Active Request Interception =====
-        "intercept_on" => {
-            let pattern = args["url_pattern"].as_str().ok_or("missing url_pattern")?;
-            client.fetch_enable(pattern).await?;
-            Ok(json!(format!(
-                "intercepting requests matching '{}'",
-                pattern
-            )))
-        }
-        "intercept_off" => {
-            client.fetch_disable().await?;
-            Ok(json!("interception stopped"))
-        }
-        "intercept_list" => client.get_paused_requests().await,
-        "intercept_continue" => {
-            let id = args["request_id"].as_str().ok_or("missing request_id")?;
-            let url = args["url"].as_str();
-            let headers = args.get("headers").filter(|v| !v.is_null());
-            let post_data = args["post_data"].as_str();
-            client.fetch_continue(id, url, headers, post_data).await?;
-            Ok(json!("request continued"))
-        }
-        "intercept_fulfill" => {
-            let id = args["request_id"].as_str().ok_or("missing request_id")?;
-            let status = args["status"].as_u64().unwrap_or(200) as u16;
-            let body = args["body"].as_str().ok_or("missing body")?;
-            client.fetch_fulfill(id, status, body).await?;
-            Ok(json!("request fulfilled"))
-        }
-        "intercept_fail" => {
-            let id = args["request_id"].as_str().ok_or("missing request_id")?;
-            client.fetch_fail(id).await?;
-            Ok(json!("request blocked"))
-        }
-        "set_cookie" => {
-            let name = args["name"].as_str().ok_or("missing name")?;
-            let value = args["value"].as_str().ok_or("missing value")?;
-            let domain = args["domain"].as_str().ok_or("missing domain")?;
-            let path = args["path"].as_str();
-            client.set_cookie(name, value, domain, path).await?;
-            Ok(json!(format!("cookie '{}' set on {}", name, domain)))
-        }
-        _ => Err(format!("unknown tool: {}", name).into()),
+
+        // All other tools: relay as CDP commands to extension
+        _ => relay_to_extension(name, args, client).await,
     }
+}
+
+/// Relay an MCP tool call as a CDP command to the extension.
+/// Maps tool names to CDP method names and forwards arguments.
+async fn relay_to_extension(
+    name: &str,
+    args: &Value,
+    client: &BridgeClient,
+) -> Result<Value, Box<dyn std::error::Error>> {
+    let (method, params) = match name {
+        "screenshot" => ("Page.captureScreenshot", json!({"format": "png"})),
+        "ax_tree" => ("Accessibility.getFullAXTree", json!({})),
+        "read_dom" => ("DOM.getDocument", json!({"depth": args["depth"].as_i64().unwrap_or(10)})),
+        "page_info" => ("Runtime.evaluate", json!({"expression": "JSON.stringify({url:location.href,title:document.title,readyState:document.readyState})", "returnByValue": true})),
+        "find" => {
+            let query = args["query"].as_str().ok_or("missing query")?;
+            let role = args["role"].as_str().unwrap_or("");
+            let expr = format!(
+                r#"JSON.stringify(Array.from(document.querySelectorAll('*')).filter(el => el.textContent.includes({}) && el.offsetParent !== null && (!{} || el.getAttribute('role') === {})).slice(0, 20).map(el => ({{tag: el.tagName, text: el.textContent.trim().substring(0,100), role: el.getAttribute('role') || ''}})))"#,
+                serde_json::to_string(query)?,
+                if role.is_empty() { "false" } else { "true" },
+                serde_json::to_string(role)?
+            );
+            ("Runtime.evaluate", json!({"expression": expr, "returnByValue": true, "awaitPromise": true}))
+        }
+        "click" => ("Input.dispatchMouseEvent", json!({"type": "mousePressed", "text": args["text"]})),
+        "click_selector" => ("Input.dispatchMouseEvent", json!({"selector": args["selector"]})),
+        "type_text" => ("Input.dispatchKeyEvent", json!({"selector": args["selector"], "text": args["text"]})),
+        "hover" | "scroll" | "press_key" | "select" | "upload"
+        | "dismiss_dialog" | "force_state" | "element_info" | "event_listeners"
+        | "cookies" | "hit_test" | "top_layer"
+        | "download" | "save_image"
+        | "network_log_start" | "network_log_dump" | "network_log_dump_bodies"
+        | "api_log" | "global_names" | "resource_tree" | "resource_content"
+        | "search_resource" | "request_replay" | "storage_items"
+        | "intercept_on" | "intercept_off" | "intercept_list"
+        | "intercept_continue" | "intercept_fulfill" | "intercept_fail"
+        | "set_cookie" => {
+            // Generic relay: send as Claw.{tool_name} with original args
+            let result = client.send(&format!("Claw.{}", name), Some(args.clone())).await?;
+            return Ok(result);
+        }
+        _ => return Err(format!("unknown tool: {}", name).into()),
+    };
+
+    let result = client.send(method, Some(params)).await?;
+    Ok(result)
 }
 
 #[cfg(test)]

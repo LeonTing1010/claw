@@ -33,6 +33,7 @@ pub struct HealthContract {
 }
 
 #[derive(Debug)]
+#[allow(dead_code)]
 pub struct AdapterInfo {
     pub site: String,
     pub name: String,

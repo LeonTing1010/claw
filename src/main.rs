@@ -39,6 +39,9 @@ enum Command {
         shell: Shell,
     },
 
+    /// Health check all claws via extension bridge
+    Check,
+
     // ---- MCP SERVER (primary interface for AI agents) ----
     /// Run as MCP server (stdin/stdout JSON-RPC) for AI agent integration
     Mcp,
@@ -110,6 +113,132 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                             .join(", ")
                     );
                 }
+            }
+        }
+        Command::Check => {
+            // Connect to extension bridge
+            let client = bridge::try_extension_bridge().await?;
+
+            // Get claw list from extension
+            let list_result = client
+                .send("Claw.list", Some(serde_json::json!({})))
+                .await?;
+
+            let claws = list_result
+                .get("claws")
+                .and_then(|c| c.as_array())
+                .cloned()
+                .unwrap_or_default();
+
+            if claws.is_empty() {
+                println!("No claws registered in extension.");
+                return Ok(());
+            }
+
+            let mut healthy = 0;
+            let mut degraded = 0;
+            let mut broken = 0;
+            let mut errors = 0;
+
+            for claw in &claws {
+                let site = claw["site"].as_str().unwrap_or("?");
+                let name = claw["name"].as_str().unwrap_or("?");
+                let adapter_name = format!("{}/{}", site, name);
+
+                // Run the claw
+                let run_result = client
+                    .send(
+                        "Claw.run",
+                        Some(serde_json::json!({
+                            "site": site,
+                            "name": name,
+                            "args": {}
+                        })),
+                    )
+                    .await;
+
+                match run_result {
+                    Err(e) => {
+                        println!("{} — Error: {}", adapter_name, e);
+                        errors += 1;
+                    }
+                    Ok(result) => {
+                        if let Some(err) = result.get("error") {
+                            println!("{} — Error: {}", adapter_name, err);
+                            errors += 1;
+                            continue;
+                        }
+
+                        let rows = result
+                            .get("rows")
+                            .and_then(|r| r.as_array())
+                            .cloned()
+                            .unwrap_or_default();
+
+                        // Try to get health contract from result
+                        let health_contract = result
+                            .get("health")
+                            .and_then(adapter::parse_health_contract);
+
+                        if let Some(contract) = health_contract {
+                            let report = health::validate(&adapter_name, &contract, &rows);
+                            let status_str = match report.status {
+                                health::HealthStatus::Healthy => {
+                                    healthy += 1;
+                                    "Healthy"
+                                }
+                                health::HealthStatus::Degraded => {
+                                    degraded += 1;
+                                    "Degraded"
+                                }
+                                health::HealthStatus::Broken => {
+                                    broken += 1;
+                                    "Broken"
+                                }
+                            };
+                            let failures: Vec<&str> = report
+                                .checks
+                                .iter()
+                                .filter(|c| !c.passed)
+                                .map(|c| c.message.as_str())
+                                .collect();
+                            if failures.is_empty() {
+                                println!("{} — {} ({} rows)", adapter_name, status_str, rows.len());
+                            } else {
+                                println!(
+                                    "{} — {} ({})",
+                                    adapter_name,
+                                    status_str,
+                                    failures.join("; ")
+                                );
+                            }
+                        } else {
+                            // No health contract — just report row count
+                            healthy += 1;
+                            println!(
+                                "{} — OK ({} rows, no health contract)",
+                                adapter_name,
+                                rows.len()
+                            );
+                        }
+                    }
+                }
+            }
+
+            println!(
+                "\n{} claws: {} healthy, {} degraded, {} broken, {} errors",
+                claws.len(),
+                healthy,
+                degraded,
+                broken,
+                errors
+            );
+
+            // Exit code: 0 = all healthy, 1 = degraded, 2 = broken/errors
+            if broken > 0 || errors > 0 {
+                std::process::exit(2);
+            } else if degraded > 0 {
+                std::process::exit(1);
             }
         }
         Command::Completions { shell } => {
